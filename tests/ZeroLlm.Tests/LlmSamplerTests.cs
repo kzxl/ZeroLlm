@@ -29,5 +29,35 @@ namespace ZeroLlm.Tests
             int selected = LlmSampler.Sample(logits, new int[] { 1 }, config);
             Assert.Equal(0, selected); // Token 0 (2.0) should now beat Token 1 (1.05)
         }
+
+        [Fact]
+        public void LogitProcessor_Should_Mask_Tokens_Before_Sampling()
+        {
+            // Token 1 has highest logit (10.0), but custom logit processor masks it to -infinity
+            float[] logits = new float[] { 2.0f, 10.0f, 4.0f };
+            var config = SamplingConfig.Greedy;
+
+            int selected = LlmSampler.Sample(logits, ReadOnlySpan<int>.Empty, config, logitProcessor: l =>
+            {
+                l[1] = float.NegativeInfinity; // Mask token 1
+            });
+
+            Assert.Equal(2, selected); // Token 2 (4.0) should now win
+        }
+
+        [Fact]
+        public void MinP_Sampling_Should_Filter_Out_Low_Probability_Tokens()
+        {
+            float[] logits = new float[] { 10.0f, 5.0f, 0.1f };
+            var config = new SamplingConfig
+            {
+                Temperature = 1.0f,
+                TopP = 1.0f,
+                MinP = 0.1f // Filters tokens with p < 0.1 * max_p
+            };
+
+            int selected = LlmSampler.Sample(logits, ReadOnlySpan<int>.Empty, config, new Random(42));
+            Assert.Equal(0, selected);
+        }
     }
 }

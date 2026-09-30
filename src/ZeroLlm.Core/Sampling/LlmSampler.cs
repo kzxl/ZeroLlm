@@ -4,7 +4,12 @@ using System.Collections.Generic;
 namespace ZeroLlm.Core.Sampling
 {
     /// <summary>
-    /// Pure C# token sampling engine supporting Greedy, Temperature scaling, Top-K, Top-P, and Repetition Penalty.
+    /// Delegate for applying arbitrary in-place logit modifications (e.g. grammar logit masking, token bans).
+    /// </summary>
+    public delegate void LogitProcessor(Span<float> logits);
+
+    /// <summary>
+    /// Pure C# token sampling engine supporting Greedy, Temperature scaling, Top-K, Top-P, Min-P, and Repetition Penalty.
     /// </summary>
     public static class LlmSampler
     {
@@ -12,9 +17,13 @@ namespace ZeroLlm.Core.Sampling
             Span<float> logits,
             ReadOnlySpan<int> pastTokens,
             SamplingConfig config,
-            Random? random = null)
+            Random? random = null,
+            LogitProcessor? logitProcessor = null)
         {
             if (logits.Length == 0) throw new ArgumentException("Logits span cannot be empty.", nameof(logits));
+
+            // 0. Apply custom Logit Processor (e.g. ZeroPrompt GrammarLogitMasker for PDA JSON/Schema decoding)
+            logitProcessor?.Invoke(logits);
 
             // 1. Apply Repetition Penalty
             if (config.RepetitionPenalty > 1.0f && pastTokens.Length > 0)
@@ -97,6 +106,19 @@ namespace ZeroLlm.Core.Sampling
             if (config.TopK > 0 && candidates.Count > config.TopK)
             {
                 candidates.RemoveRange(config.TopK, candidates.Count - config.TopK);
+            }
+
+            // Truncate by Min-P
+            if (config.MinP > 0.0f && candidates.Count > 0)
+            {
+                float minThreshold = candidates[0].Value * config.MinP;
+                for (int i = candidates.Count - 1; i >= 1; i--)
+                {
+                    if (candidates[i].Value < minThreshold)
+                    {
+                        candidates.RemoveAt(i);
+                    }
+                }
             }
 
             // Truncate by Top-P (Nucleus)
