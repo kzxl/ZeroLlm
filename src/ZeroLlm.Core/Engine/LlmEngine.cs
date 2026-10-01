@@ -41,19 +41,35 @@ namespace ZeroLlm.Core.Engine
                 headDim: cfg.HeadDim);
         }
 
-        public async Task<string> CompleteAsync(string prompt, CancellationToken cancellationToken = default)
+        public Task<string> CompleteAsync(string prompt, CancellationToken cancellationToken = default)
+            => CompleteAsync(prompt, _defaultSampling, null, cancellationToken);
+
+        public async Task<string> CompleteAsync(
+            string prompt,
+            SamplingConfig? samplingConfig,
+            LogitProcessor? logitProcessor = null,
+            CancellationToken cancellationToken = default)
         {
             var sb = new StringBuilder();
-            await foreach (var piece in GenerateStreamAsync(prompt, cancellationToken).ConfigureAwait(false))
+            await foreach (var piece in GenerateStreamAsync(prompt, samplingConfig, logitProcessor, cancellationToken).ConfigureAwait(false))
             {
                 sb.Append(piece);
             }
             return sb.ToString();
         }
 
-        public async IAsyncEnumerable<string> GenerateStreamAsync(string prompt, [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken = default)
+        public IAsyncEnumerable<string> GenerateStreamAsync(string prompt, CancellationToken cancellationToken = default)
+            => GenerateStreamAsync(prompt, _defaultSampling, null, cancellationToken);
+
+        public async IAsyncEnumerable<string> GenerateStreamAsync(
+            string prompt,
+            SamplingConfig? samplingConfig,
+            LogitProcessor? logitProcessor = null,
+            [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken = default)
         {
             if (string.IsNullOrEmpty(prompt)) yield break;
+
+            var sampling = samplingConfig ?? _defaultSampling;
 
             int seqId = Interlocked.Increment(ref _nextSeqId);
             int[] promptTokens = _tokenizer.Encode(prompt);
@@ -61,7 +77,7 @@ namespace ZeroLlm.Core.Engine
             if (promptTokens.Length == 0) yield break;
 
             var cfg = _model.Config;
-            var pastTokens = new List<int>(promptTokens.Length + _defaultSampling.MaxTokens);
+            var pastTokens = new List<int>(promptTokens.Length + sampling.MaxTokens);
             pastTokens.AddRange(promptTokens);
 
             // Scratch memory buffers
@@ -90,13 +106,13 @@ namespace ZeroLlm.Core.Engine
                 int currentPos = promptTokens.Length;
                 int generatedCount = 0;
 
-                while (generatedCount < _defaultSampling.MaxTokens)
+                while (generatedCount < sampling.MaxTokens)
                 {
                     cancellationToken.ThrowIfCancellationRequested();
 
-                    // Sample next token
-                    int nextToken = LlmSampler.Sample(logits, pastTokens.ToArray(), _defaultSampling);
-                    if (nextToken == cfg.EosTokenId || _defaultSampling.StopTokens.Contains(nextToken))
+                    // Sample next token with grammar/custom logit processing
+                    int nextToken = LlmSampler.Sample(logits, pastTokens.ToArray(), sampling, logitProcessor: logitProcessor);
+                    if (nextToken == cfg.EosTokenId || sampling.StopTokens.Contains(nextToken))
                     {
                         break;
                     }
