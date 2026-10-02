@@ -1,0 +1,871 @@
+using System;
+using System.Collections.Generic;
+using ZeroLlm.Core.Engine;
+using ZeroLlm.Core.Layers;
+using ZeroTokenizer.Core.Abstractions;
+
+namespace ZeroLlm.Core.Training
+{
+    /// <summary>
+    /// Pure C# Masked Causal Language Model Trainer with AdamW optimization.
+    /// Supports full parameter Supervised Fine-Tuning (SFT), head/embedding adaptation, and domain pre-training.
+    /// </summary>
+    public sealed class LlmTrainer
+    {
+        private readonly LlmModel _model;
+        private readonly TrainingConfig _config;
+        private int _step;
+
+        // Trainable parameter tracking
+        private readonly List<ParamGrad> _trainableParams = new List<ParamGrad>();
+        private readonly ParamGrad _embParam;
+        private readonly ParamGrad _finalNormParam;
+        private readonly ParamGrad _lmHeadParam;
+        private readonly LayerParamGrad[] _layerParams;
+
+        private sealed class ParamGrad
+        {
+            public float[] Weights { get; }
+            public float[] Grads { get; }
+            public float[] M { get; }
+            public float[] V { get; }
+
+            public ParamGrad(float[] weights)
+            {
+                Weights = weights ?? throw new ArgumentNullException(nameof(weights));
+                Grads = new float[weights.Length];
+                M = new float[weights.Length];
+                V = new float[weights.Length];
+            }
+
+            public void ZeroGrad() => Array.Clear(Grads, 0, Grads.Length);
+        }
+
+        private sealed class LayerParamGrad
+        {
+            public ParamGrad AttnNorm { get; }
+            public ParamGrad Wq { get; }
+            public ParamGrad Wk { get; }
+            public ParamGrad Wv { get; }
+            public ParamGrad Wo { get; }
+            public ParamGrad FfnNorm { get; }
+            public ParamGrad Wgate { get; }
+            public ParamGrad Wup { get; }
+            public ParamGrad Wdown { get; }
+
+            public LayerParamGrad(LlmLayerWeights layer)
+            {
+                AttnNorm = new ParamGrad(layer.AttnNorm);
+                Wq = new ParamGrad(layer.Wq);
+                Wk = new ParamGrad(layer.Wk);
+                Wv = new ParamGrad(layer.Wv);
+                Wo = new ParamGrad(layer.Wo);
+                FfnNorm = new ParamGrad(layer.FfnNorm);
+                Wgate = new ParamGrad(layer.Wgate);
+                Wup = new ParamGrad(layer.Wup);
+                Wdown = new ParamGrad(layer.Wdown);
+            }
+
+            public void RegisterParams(List<ParamGrad> list)
+            {
+                list.Add(AttnNorm);
+                list.Add(Wq);
+                list.Add(Wk);
+                list.Add(Wv);
+                list.Add(Wo);
+                list.Add(FfnNorm);
+                list.Add(Wgate);
+                list.Add(Wup);
+                list.Add(Wdown);
+            }
+        }
+
+        public LlmModel Model => _model;
+        public TrainingConfig Config => _config;
+        public int CurrentStep => _step;
+
+        public LlmTrainer(LlmModel model, TrainingConfig? config = null)
+        {
+            _model = model ?? throw new ArgumentNullException(nameof(model));
+            _config = config ?? new TrainingConfig();
+
+            _embParam = new ParamGrad(_model.TokenEmbeddings);
+            _finalNormParam = new ParamGrad(_model.FinalNorm);
+            _lmHeadParam = new ParamGrad(_model.LmHead);
+
+            _layerParams = new LayerParamGrad[_model.Config.LayerCount];
+            for (int l = 0; l < _model.Config.LayerCount; l++)
+            {
+                _layerParams[l] = new LayerParamGrad(_model.Layers[l]);
+            }
+
+            // Register active parameters according to mode
+            RebuildTrainableParams();
+        }
+
+        private void RebuildTrainableParams()
+        {
+            _trainableParams.Clear();
+
+            switch (_config.Mode)
+            {
+                case TrainingMode.Full:
+                    _trainableParams.Add(_embParam);
+                    for (int l = 0; l < _layerParams.Length; l++)
+                    {
+                        _layerParams[l].RegisterParams(_trainableParams);
+                    }
+                    _trainableParams.Add(_finalNormParam);
+                    _trainableParams.Add(_lmHeadParam);
+                    break;
+
+                case TrainingMode.HeadAndEmbeddings:
+                    _trainableParams.Add(_embParam);
+                    _trainableParams.Add(_finalNormParam);
+                    _trainableParams.Add(_lmHeadParam);
+                    break;
+
+                case TrainingMode.HeadOnly:
+                    _trainableParams.Add(_lmHeadParam);
+                    break;
+            }
+        }
+
+        /// <summary>
+        /// Executes a single masked causal language modeling training step over a sequence of tokens.
+        /// Tokens prior to targetStartPos are treated as prompt context (masked from loss).
+        /// </summary>
+        public TrainStepResult TrainStep(int[] tokens, int? targetStartPos = null)
+        {
+            if (tokens == null || tokens.Length < 2)
+            {
+                return new TrainStepResult(0f, 0, 0f);
+            }
+
+            int seqLen = tokens.Length;
+            int numPositions = seqLen - 1;
+            int targetStart = targetStartPos ?? 1;
+            if (targetStart < 1) targetStart = 1;
+
+            var cfg = _model.Config;
+            int embDim = cfg.EmbeddingDim;
+            int qDim = cfg.HeadCount * cfg.HeadDim;
+            int kvDim = cfg.HeadCountKv * cfg.HeadDim;
+            int headDim = cfg.HeadDim;
+            int ffnDim = cfg.FeedForwardDim;
+            int vocabSize = cfg.VocabSize;
+            int layers = cfg.LayerCount;
+
+            // Zero all gradients before accumulation
+            for (int i = 0; i < _trainableParams.Count; i++)
+            {
+                _trainableParams[i].ZeroGrad();
+            }
+
+            // 1. Forward Pass Storage
+            // xIn per token
+            float[][] xIn = new float[numPositions][];
+            // activations per (pos, layer)
+            float[][][] xNormAttn = new float[numPositions][][];
+            float[][][] q = new float[numPositions][][];
+            float[][][] k = new float[numPositions][][];
+            float[][][] v = new float[numPositions][][];
+            float[][][][] attnWeights = new float[numPositions][][][]; // [pos][layer][head][tau]
+            float[][][] attnOut = new float[numPositions][][];
+            float[][][] xMid = new float[numPositions][][];
+            float[][][] xNormFfn = new float[numPositions][][];
+            float[][][] gate = new float[numPositions][][];
+            float[][][] up = new float[numPositions][][];
+            float[][][] swiglu = new float[numPositions][][];
+            float[][][] xOut = new float[numPositions][][];
+
+            float[][] xNormFinal = new float[numPositions][];
+            float[][] logits = new float[numPositions][];
+
+            float[] currentX = new float[embDim];
+
+            for (int pos = 0; pos < numPositions; pos++)
+            {
+                xIn[pos] = new float[embDim];
+                xNormAttn[pos] = new float[layers][];
+                q[pos] = new float[layers][];
+                k[pos] = new float[layers][];
+                v[pos] = new float[layers][];
+                attnWeights[pos] = new float[layers][][];
+                attnOut[pos] = new float[layers][];
+                xMid[pos] = new float[layers][];
+                xNormFfn[pos] = new float[layers][];
+                gate[pos] = new float[layers][];
+                up[pos] = new float[layers][];
+                swiglu[pos] = new float[layers][];
+                xOut[pos] = new float[layers][];
+
+                xNormFinal[pos] = new float[embDim];
+                logits[pos] = new float[vocabSize];
+
+                // Embedding lookup
+                int tok = tokens[pos];
+                int safeTok = (tok >= 0 && tok < vocabSize) ? tok : 0;
+                Array.Copy(_model.TokenEmbeddings, safeTok * embDim, xIn[pos], 0, embDim);
+                Array.Copy(xIn[pos], currentX, embDim);
+
+                for (int l = 0; l < layers; l++)
+                {
+                    var layer = _model.Layers[l];
+                    xNormAttn[pos][l] = new float[embDim];
+                    q[pos][l] = new float[qDim];
+                    k[pos][l] = new float[kvDim];
+                    v[pos][l] = new float[kvDim];
+                    attnOut[pos][l] = new float[qDim];
+                    xMid[pos][l] = new float[embDim];
+                    xNormFfn[pos][l] = new float[embDim];
+                    gate[pos][l] = new float[ffnDim];
+                    up[pos][l] = new float[ffnDim];
+                    swiglu[pos][l] = new float[ffnDim];
+                    xOut[pos][l] = new float[embDim];
+
+                    // Attn RMSNorm
+                    RmsNorm.Forward(currentX, layer.AttnNorm, xNormAttn[pos][l], cfg.RmsNormEps);
+
+                    // Q, K, V Projections
+                    MatVec(xNormAttn[pos][l], layer.Wq, embDim, qDim, q[pos][l]);
+                    MatVec(xNormAttn[pos][l], layer.Wk, embDim, kvDim, k[pos][l]);
+                    MatVec(xNormAttn[pos][l], layer.Wv, embDim, kvDim, v[pos][l]);
+
+                    // RoPE
+                    for (int h = 0; h < cfg.HeadCount; h++)
+                    {
+                        RoPE.ApplyInplace(q[pos][l].AsSpan(h * headDim, headDim), pos, headDim, cfg.RopeFreqBase);
+                    }
+                    for (int h = 0; h < cfg.HeadCountKv; h++)
+                    {
+                        RoPE.ApplyInplace(k[pos][l].AsSpan(h * headDim, headDim), pos, headDim, cfg.RopeFreqBase);
+                    }
+
+                    // Attention computation across tau = 0..pos
+                    attnWeights[pos][l] = new float[cfg.HeadCount][];
+                    ForwardAttention(
+                        q[pos][l], k, v, pos, l,
+                        cfg.HeadCount, cfg.HeadCountKv, headDim,
+                        attnOut[pos][l], attnWeights[pos][l]);
+
+                    // Wo projection + Residual Add
+                    Array.Copy(currentX, xMid[pos][l], embDim);
+                    MatVecAdd(attnOut[pos][l], layer.Wo, qDim, embDim, xMid[pos][l]);
+
+                    // FFN RMSNorm
+                    RmsNorm.Forward(xMid[pos][l], layer.FfnNorm, xNormFfn[pos][l], cfg.RmsNormEps);
+
+                    // SwiGLU
+                    MatVec(xNormFfn[pos][l], layer.Wgate, embDim, ffnDim, gate[pos][l]);
+                    MatVec(xNormFfn[pos][l], layer.Wup, embDim, ffnDim, up[pos][l]);
+                    SwiGLU.Forward(gate[pos][l], up[pos][l], swiglu[pos][l]);
+
+                    // Wdown + Residual Add
+                    Array.Copy(xMid[pos][l], xOut[pos][l], embDim);
+                    MatVecAdd(swiglu[pos][l], layer.Wdown, ffnDim, embDim, xOut[pos][l]);
+
+                    Array.Copy(xOut[pos][l], currentX, embDim);
+                }
+
+                // Final RMSNorm
+                RmsNorm.Forward(currentX, _model.FinalNorm, xNormFinal[pos], cfg.RmsNormEps);
+
+                // LM Head Projection
+                MatVec(xNormFinal[pos], _model.LmHead, embDim, vocabSize, logits[pos]);
+            }
+
+            // 2. Cross-Entropy Loss & dLogits
+            float totalLoss = 0f;
+            int activeTargets = 0;
+            float[][] dLogits = new float[numPositions][];
+
+            for (int pos = 0; pos < numPositions; pos++)
+            {
+                dLogits[pos] = new float[vocabSize];
+                int targetTokenId = tokens[pos + 1];
+                bool isTarget = (pos + 1 >= targetStart);
+
+                if (!isTarget) continue;
+
+                // Softmax
+                float maxVal = float.NegativeInfinity;
+                for (int i = 0; i < vocabSize; i++)
+                {
+                    if (logits[pos][i] > maxVal) maxVal = logits[pos][i];
+                }
+
+                float sumExp = 0f;
+                for (int i = 0; i < vocabSize; i++)
+                {
+                    float e = (float)Math.Exp(logits[pos][i] - maxVal);
+                    dLogits[pos][i] = e;
+                    sumExp += e;
+                }
+
+                float invSum = 1.0f / (sumExp + 1e-9f);
+                for (int i = 0; i < vocabSize; i++)
+                {
+                    dLogits[pos][i] *= invSum;
+                }
+
+                int safeTarget = (targetTokenId >= 0 && targetTokenId < vocabSize) ? targetTokenId : 0;
+                float targetProb = Math.Max(dLogits[pos][safeTarget], 1e-9f);
+                float loss = -(float)Math.Log(targetProb);
+
+                totalLoss += loss;
+                activeTargets++;
+
+                // Softmax gradient: P[i] - 1{i == target}
+                dLogits[pos][safeTarget] -= 1.0f;
+            }
+
+            if (activeTargets == 0)
+            {
+                return new TrainStepResult(0f, 0, 0f);
+            }
+
+            // Scale gradients by 1 / activeTargets
+            float scale = 1.0f / activeTargets;
+            for (int pos = 0; pos < numPositions; pos++)
+            {
+                if (pos + 1 < targetStart) continue;
+                for (int i = 0; i < vocabSize; i++)
+                {
+                    dLogits[pos][i] *= scale;
+                }
+            }
+
+            // 3. Backward Pass
+            // Cumulative key and value gradients across time positions
+            float[][][] dK = new float[numPositions][][];
+            float[][][] dV = new float[numPositions][][];
+            for (int p = 0; p < numPositions; p++)
+            {
+                dK[p] = new float[layers][];
+                dV[p] = new float[layers][];
+                for (int l = 0; l < layers; l++)
+                {
+                    dK[p][l] = new float[kvDim];
+                    dV[p][l] = new float[kvDim];
+                }
+            }
+
+            float[] dxNormFinal = new float[embDim];
+            float[] dx = new float[embDim];
+            float[] dSwiglu = new float[ffnDim];
+            float[] dGate = new float[ffnDim];
+            float[] dUp = new float[ffnDim];
+            float[] dxNormFfn = new float[embDim];
+            float[] dResidFfn = new float[embDim];
+            float[] dxMid = new float[embDim];
+            float[] dAttnOut = new float[qDim];
+            float[] dQ = new float[qDim];
+            float[] dxNormAttn = new float[embDim];
+            float[] dResidAttn = new float[embDim];
+
+            for (int pos = numPositions - 1; pos >= 0; pos--)
+            {
+                if (pos + 1 < targetStart) continue;
+
+                // 3.1 LM Head gradient
+                Array.Clear(dxNormFinal, 0, embDim);
+                for (int vIdx = 0; vIdx < vocabSize; vIdx++)
+                {
+                    float dL = dLogits[pos][vIdx];
+                    if (dL == 0f) continue;
+                    int rowOff = vIdx * embDim;
+                    for (int i = 0; i < embDim; i++)
+                    {
+                        _lmHeadParam.Grads[rowOff + i] += dL * xNormFinal[pos][i];
+                        dxNormFinal[i] += dL * _model.LmHead[rowOff + i];
+                    }
+                }
+
+                // 3.2 Final RMSNorm backward
+                BackpropRmsNorm(dxNormFinal, xOut[pos][layers - 1], _model.FinalNorm, _finalNormParam.Grads, dx, cfg.RmsNormEps);
+
+                if (_config.Mode == TrainingMode.HeadOnly) continue;
+
+                if (_config.Mode == TrainingMode.HeadAndEmbeddings)
+                {
+                    int tok = tokens[pos];
+                    int safeTok = (tok >= 0 && tok < vocabSize) ? tok : 0;
+                    int embOff = safeTok * embDim;
+                    for (int i = 0; i < embDim; i++)
+                    {
+                        _embParam.Grads[embOff + i] += dx[i];
+                    }
+                    continue;
+                }
+
+                // 3.3 Full Layer Backward
+                for (int l = layers - 1; l >= 0; l--)
+                {
+                    var layer = _model.Layers[l];
+                    var lParams = _layerParams[l];
+
+                    // Wdown backprop
+                    Array.Clear(dSwiglu, 0, ffnDim);
+                    for (int o = 0; o < embDim; o++)
+                    {
+                        float dX_o = dx[o];
+                        if (dX_o == 0f) continue;
+                        int rowOff = o * ffnDim;
+                        for (int i = 0; i < ffnDim; i++)
+                        {
+                            lParams.Wdown.Grads[rowOff + i] += dX_o * swiglu[pos][l][i];
+                            dSwiglu[i] += dX_o * layer.Wdown[rowOff + i];
+                        }
+                    }
+
+                    // SwiGLU backward
+                    for (int i = 0; i < ffnDim; i++)
+                    {
+                        float gVal = gate[pos][l][i];
+                        float uVal = up[pos][l][i];
+                        float sig = 1.0f / (1.0f + (float)Math.Exp(-gVal));
+                        float swish = gVal * sig;
+                        float dSwish = sig * (1.0f + gVal * (1.0f - sig));
+                        dUp[i] = dSwiglu[i] * swish;
+                        dGate[i] = dSwiglu[i] * uVal * dSwish;
+                    }
+
+                    // Wgate & Wup backprop
+                    Array.Clear(dxNormFfn, 0, embDim);
+                    for (int kIdx = 0; kIdx < ffnDim; kIdx++)
+                    {
+                        float dg = dGate[kIdx];
+                        float du = dUp[kIdx];
+                        int rowOff = kIdx * embDim;
+                        for (int j = 0; j < embDim; j++)
+                        {
+                            lParams.Wgate.Grads[rowOff + j] += dg * xNormFfn[pos][l][j];
+                            lParams.Wup.Grads[rowOff + j] += du * xNormFfn[pos][l][j];
+                            dxNormFfn[j] += dg * layer.Wgate[rowOff + j] + du * layer.Wup[rowOff + j];
+                        }
+                    }
+
+                    // FfnNorm backward
+                    BackpropRmsNorm(dxNormFfn, xMid[pos][l], layer.FfnNorm, lParams.FfnNorm.Grads, dResidFfn, cfg.RmsNormEps);
+
+                    // Residual connection
+                    for (int i = 0; i < embDim; i++)
+                    {
+                        dxMid[i] = dx[i] + dResidFfn[i];
+                    }
+
+                    // Wo backprop
+                    Array.Clear(dAttnOut, 0, qDim);
+                    for (int o = 0; o < embDim; o++)
+                    {
+                        float dXm_o = dxMid[o];
+                        if (dXm_o == 0f) continue;
+                        int rowOff = o * qDim;
+                        for (int kIdx = 0; kIdx < qDim; kIdx++)
+                        {
+                            lParams.Wo.Grads[rowOff + kIdx] += dXm_o * attnOut[pos][l][kIdx];
+                            dAttnOut[kIdx] += dXm_o * layer.Wo[rowOff + kIdx];
+                        }
+                    }
+
+                    // Attention backward across tau = 0..pos
+                    Array.Clear(dQ, 0, qDim);
+                    BackwardAttention(
+                        dAttnOut, q[pos][l], k, v, pos, l,
+                        cfg.HeadCount, cfg.HeadCountKv, headDim,
+                        attnWeights[pos][l], dQ, dK, dV);
+
+                    // Inverse RoPE on dQ and dK
+                    for (int h = 0; h < cfg.HeadCount; h++)
+                    {
+                        RoPE.ApplyInverseInplace(dQ.AsSpan(h * headDim, headDim), pos, headDim, cfg.RopeFreqBase);
+                    }
+                    for (int h = 0; h < cfg.HeadCountKv; h++)
+                    {
+                        RoPE.ApplyInverseInplace(dK[pos][l].AsSpan(h * headDim, headDim), pos, headDim, cfg.RopeFreqBase);
+                    }
+
+                    // Wq, Wk, Wv backprop
+                    Array.Clear(dxNormAttn, 0, embDim);
+                    for (int kIdx = 0; kIdx < qDim; kIdx++)
+                    {
+                        float dqVal = dQ[kIdx];
+                        if (dqVal == 0f) continue;
+                        int rowOff = kIdx * embDim;
+                        for (int j = 0; j < embDim; j++)
+                        {
+                            lParams.Wq.Grads[rowOff + j] += dqVal * xNormAttn[pos][l][j];
+                            dxNormAttn[j] += dqVal * layer.Wq[rowOff + j];
+                        }
+                    }
+
+                    for (int kIdx = 0; kIdx < kvDim; kIdx++)
+                    {
+                        float dkVal = dK[pos][l][kIdx];
+                        float dvVal = dV[pos][l][kIdx];
+                        int rowOff = kIdx * embDim;
+                        for (int j = 0; j < embDim; j++)
+                        {
+                            if (dkVal != 0f)
+                            {
+                                lParams.Wk.Grads[rowOff + j] += dkVal * xNormAttn[pos][l][j];
+                                dxNormAttn[j] += dkVal * layer.Wk[rowOff + j];
+                            }
+                            if (dvVal != 0f)
+                            {
+                                lParams.Wv.Grads[rowOff + j] += dvVal * xNormAttn[pos][l][j];
+                                dxNormAttn[j] += dvVal * layer.Wv[rowOff + j];
+                            }
+                        }
+                    }
+
+                    // AttnNorm backward
+                    float[] prevInput = (l == 0) ? xIn[pos] : xOut[pos][l - 1];
+                    BackpropRmsNorm(dxNormAttn, prevInput, layer.AttnNorm, lParams.AttnNorm.Grads, dResidAttn, cfg.RmsNormEps);
+
+                    // Add to residual for next lower layer
+                    for (int i = 0; i < embDim; i++)
+                    {
+                        dx[i] = dxMid[i] + dResidAttn[i];
+                    }
+                }
+
+                // 3.4 Token embedding gradient
+                int inputTok = tokens[pos];
+                int safeInputTok = (inputTok >= 0 && inputTok < vocabSize) ? inputTok : 0;
+                int embRow = safeInputTok * embDim;
+                for (int i = 0; i < embDim; i++)
+                {
+                    _embParam.Grads[embRow + i] += dx[i];
+                }
+            }
+
+            // 4. AdamW Parameter Update Step
+            _step++;
+            float gradNorm = ApplyAdamW();
+
+            float avgLoss = totalLoss / activeTargets;
+            return new TrainStepResult(avgLoss, activeTargets, gradNorm);
+        }
+
+        private float ApplyAdamW()
+        {
+            // Global gradient norm clipping
+            double sumSq = 0.0;
+            for (int p = 0; p < _trainableParams.Count; p++)
+            {
+                var grads = _trainableParams[p].Grads;
+                for (int i = 0; i < grads.Length; i++)
+                {
+                    sumSq += grads[i] * grads[i];
+                }
+            }
+
+            float totalNorm = (float)Math.Sqrt(sumSq);
+            float clipScale = 1.0f;
+            if (_config.MaxGradNorm > 0 && totalNorm > _config.MaxGradNorm)
+            {
+                clipScale = _config.MaxGradNorm / (totalNorm + 1e-6f);
+            }
+
+            float b1 = _config.Beta1;
+            float b2 = _config.Beta2;
+            float lr = _config.LearningRate;
+            float wd = _config.WeightDecay;
+            float eps = _config.Epsilon;
+
+            float bc1 = 1.0f - (float)Math.Pow(b1, _step);
+            float bc2 = 1.0f - (float)Math.Pow(b2, _step);
+
+            for (int p = 0; p < _trainableParams.Count; p++)
+            {
+                var param = _trainableParams[p];
+                var w = param.Weights;
+                var g = param.Grads;
+                var m = param.M;
+                var v = param.V;
+
+                for (int i = 0; i < w.Length; i++)
+                {
+                    float grad = g[i] * clipScale;
+
+                    m[i] = b1 * m[i] + (1.0f - b1) * grad;
+                    v[i] = b2 * v[i] + (1.0f - b2) * grad * grad;
+
+                    float mHat = m[i] / bc1;
+                    float vHat = v[i] / bc2;
+
+                    w[i] -= lr * (mHat / ((float)Math.Sqrt(vHat) + eps) + wd * w[i]);
+                }
+            }
+
+            return totalNorm;
+        }
+
+        private static void ForwardAttention(
+            float[] q,
+            float[][][] kAll,
+            float[][][] vAll,
+            int pos,
+            int layer,
+            int qHeadCount,
+            int kvHeadCount,
+            int headDim,
+            float[] output,
+            float[][] weightsOut)
+        {
+            int groupSize = qHeadCount / kvHeadCount;
+            float scale = 1.0f / (float)Math.Sqrt(headDim);
+            int seqLen = pos + 1;
+
+            for (int qh = 0; qh < qHeadCount; qh++)
+            {
+                int kvHead = qh / groupSize;
+                int qOffset = qh * headDim;
+                int outOffset = qh * headDim;
+
+                weightsOut[qh] = new float[seqLen];
+                float maxScore = float.NegativeInfinity;
+
+                // 1. Dot product
+                for (int t = 0; t < seqLen; t++)
+                {
+                    var kVec = kAll[t][layer];
+                    int kOffset = kvHead * headDim;
+
+                    float dot = 0f;
+                    for (int d = 0; d < headDim; d++)
+                    {
+                        dot += q[qOffset + d] * kVec[kOffset + d];
+                    }
+                    float s = dot * scale;
+                    weightsOut[qh][t] = s;
+                    if (s > maxScore) maxScore = s;
+                }
+
+                // 2. Softmax
+                float sumExp = 0f;
+                for (int t = 0; t < seqLen; t++)
+                {
+                    float exp = (float)Math.Exp(weightsOut[qh][t] - maxScore);
+                    weightsOut[qh][t] = exp;
+                    sumExp += exp;
+                }
+
+                float invSum = sumExp > 0f ? 1.0f / sumExp : 0f;
+                for (int t = 0; t < seqLen; t++)
+                {
+                    weightsOut[qh][t] *= invSum;
+                }
+
+                // 3. Value aggregation
+                for (int d = 0; d < headDim; d++) output[outOffset + d] = 0f;
+
+                for (int t = 0; t < seqLen; t++)
+                {
+                    float w = weightsOut[qh][t];
+                    if (w <= 0f) continue;
+
+                    var vVec = vAll[t][layer];
+                    int vOffset = kvHead * headDim;
+
+                    for (int d = 0; d < headDim; d++)
+                    {
+                        output[outOffset + d] += w * vVec[vOffset + d];
+                    }
+                }
+            }
+        }
+
+        private static void BackwardAttention(
+            float[] dAttnOut,
+            float[] q,
+            float[][][] kAll,
+            float[][][] vAll,
+            int pos,
+            int layer,
+            int qHeadCount,
+            int kvHeadCount,
+            int headDim,
+            float[][] weights,
+            float[] dQ,
+            float[][][] dK,
+            float[][][] dV)
+        {
+            int groupSize = qHeadCount / kvHeadCount;
+            float scale = 1.0f / (float)Math.Sqrt(headDim);
+            int seqLen = pos + 1;
+
+            // 1. dV accumulation and dWeights computation scratch buffer
+            Span<float> dAlpha = stackalloc float[Math.Min(seqLen, 1024)];
+            float[]? rentedAlpha = null;
+            if (seqLen > 1024)
+            {
+                rentedAlpha = new float[seqLen];
+                dAlpha = rentedAlpha;
+            }
+
+            for (int qh = 0; qh < qHeadCount; qh++)
+            {
+                int kvHead = qh / groupSize;
+                int qOffset = qh * headDim;
+                int outOffset = qh * headDim;
+
+                for (int t = 0; t < seqLen; t++)
+                {
+                    float alpha = weights[qh][t];
+                    var vVec = vAll[t][layer];
+                    var dVVec = dV[t][layer];
+                    int vOffset = kvHead * headDim;
+
+                    float dot = 0f;
+                    for (int d = 0; d < headDim; d++)
+                    {
+                        float dOut = dAttnOut[outOffset + d];
+                        dVVec[vOffset + d] += alpha * dOut;
+                        dot += dOut * vVec[vOffset + d];
+                    }
+                    dAlpha[t] = dot;
+                }
+
+                // 2. Softmax backward
+                float sumAlphaDAlpha = 0f;
+                for (int t = 0; t < seqLen; t++)
+                {
+                    sumAlphaDAlpha += weights[qh][t] * dAlpha[t];
+                }
+
+                for (int t = 0; t < seqLen; t++)
+                {
+                    float alpha = weights[qh][t];
+                    float ds = alpha * (dAlpha[t] - sumAlphaDAlpha);
+
+                    // 3. dQ and dK accumulation
+                    var kVec = kAll[t][layer];
+                    var dKVec = dK[t][layer];
+                    int kOffset = kvHead * headDim;
+
+                    float scaledDs = ds * scale;
+                    for (int d = 0; d < headDim; d++)
+                    {
+                        dQ[qOffset + d] += scaledDs * kVec[kOffset + d];
+                        dKVec[kOffset + d] += scaledDs * q[qOffset + d];
+                    }
+                }
+            }
+        }
+
+        private static void BackpropRmsNorm(
+            ReadOnlySpan<float> dy,
+            ReadOnlySpan<float> x,
+            ReadOnlySpan<float> weight,
+            Span<float> dWeight,
+            Span<float> dx,
+            float eps = 1e-5f)
+        {
+            int len = x.Length;
+            float sumSq = 0f;
+            for (int i = 0; i < len; i++) sumSq += x[i] * x[i];
+            float meanSq = sumSq / len;
+            float invRms = 1.0f / (float)Math.Sqrt(meanSq + eps);
+            float invRms3 = invRms * invRms * invRms;
+
+            float sumDyWx = 0f;
+            for (int i = 0; i < len; i++)
+            {
+                float dy_w = dy[i] * weight[i];
+                sumDyWx += dy_w * x[i];
+                dWeight[i] += dy[i] * x[i] * invRms;
+            }
+
+            float factor = (sumDyWx / len) * invRms3;
+            for (int i = 0; i < len; i++)
+            {
+                dx[i] = invRms * dy[i] * weight[i] - x[i] * factor;
+            }
+        }
+
+        private static void MatVec(ReadOnlySpan<float> input, ReadOnlySpan<float> weight, int inDim, int outDim, Span<float> output)
+        {
+            for (int o = 0; o < outDim; o++)
+            {
+                float dot = 0f;
+                int rowOff = o * inDim;
+                for (int i = 0; i < inDim; i++)
+                {
+                    dot += input[i] * weight[rowOff + i];
+                }
+                output[o] = dot;
+            }
+        }
+
+        private static void MatVecAdd(ReadOnlySpan<float> input, ReadOnlySpan<float> weight, int inDim, int outDim, Span<float> accOutput)
+        {
+            for (int o = 0; o < outDim; o++)
+            {
+                float dot = 0f;
+                int rowOff = o * inDim;
+                for (int i = 0; i < inDim; i++)
+                {
+                    dot += input[i] * weight[rowOff + i];
+                }
+                accOutput[o] += dot;
+            }
+        }
+
+        /// <summary>
+        /// Convenience training method for Supervised Fine-Tuning (SFT) over prompt-response pairs.
+        /// Automatically formats tokens and sets targetStartPos to the start of the response.
+        /// </summary>
+        public TrainStepResult TrainStep(string prompt, string response, ITokenizer tokenizer)
+        {
+            if (tokenizer == null) throw new ArgumentNullException(nameof(tokenizer));
+
+            int[] promptTokens = tokenizer.Encode(prompt ?? string.Empty);
+            int[] responseTokens = tokenizer.Encode(response ?? string.Empty);
+
+            var combined = new int[promptTokens.Length + responseTokens.Length];
+            Array.Copy(promptTokens, 0, combined, 0, promptTokens.Length);
+            Array.Copy(responseTokens, 0, combined, promptTokens.Length, responseTokens.Length);
+
+            return TrainStep(combined, promptTokens.Length);
+        }
+
+        /// <summary>
+        /// Runs a complete training epoch across an enumeration of token sequences.
+        /// </summary>
+        public TrainEpochResult TrainEpoch(
+            IEnumerable<int[]> dataset,
+            int epoch = 1,
+            int? targetStartPos = null,
+            Action<TrainProgress>? onProgress = null)
+        {
+            if (dataset == null) throw new ArgumentNullException(nameof(dataset));
+
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            float runningLoss = 0f;
+            int totalTokens = 0;
+            int step = 0;
+
+            foreach (var seq in dataset)
+            {
+                step++;
+                var result = TrainStep(seq, targetStartPos);
+                runningLoss += result.Loss;
+                totalTokens += result.TargetTokenCount;
+
+                onProgress?.Invoke(new TrainProgress(step, -1, result.Loss, runningLoss / step, result.GradNorm));
+            }
+
+            sw.Stop();
+            return new TrainEpochResult
+            {
+                Epoch = epoch,
+                AverageLoss = step > 0 ? runningLoss / step : 0f,
+                TotalTrainedTokens = totalTokens,
+                Elapsed = sw.Elapsed
+            };
+        }
+    }
+}
