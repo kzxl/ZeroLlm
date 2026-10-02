@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Numerics;
 using ZeroLlm.Core.Engine;
 using ZeroLlm.Core.Layers;
 using ZeroTokenizer.Core.Abstractions;
@@ -370,15 +371,40 @@ namespace ZeroLlm.Core.Training
 
                 // 3.1 LM Head gradient
                 Array.Clear(dxNormFinal, 0, embDim);
-                for (int vIdx = 0; vIdx < vocabSize; vIdx++)
+                unsafe
                 {
-                    float dL = dLogits[pos][vIdx];
-                    if (dL == 0f) continue;
-                    int rowOff = vIdx * embDim;
-                    for (int i = 0; i < embDim; i++)
+                    fixed (float* pXNorm = xNormFinal[pos])
+                    fixed (float* pLmHead = _model.LmHead)
+                    fixed (float* pGrads = _lmHeadParam.Grads)
+                    fixed (float* pDxNorm = dxNormFinal)
                     {
-                        _lmHeadParam.Grads[rowOff + i] += dL * xNormFinal[pos][i];
-                        dxNormFinal[i] += dL * _model.LmHead[rowOff + i];
+                        int vecSize = Vector<float>.Count;
+                        int simdLimit = embDim - (embDim % vecSize);
+
+                        for (int vIdx = 0; vIdx < vocabSize; vIdx++)
+                        {
+                            float dL = dLogits[pos][vIdx];
+                            if (dL == 0f) continue;
+                            int rowOff = vIdx * embDim;
+                            var vDl = new Vector<float>(dL);
+
+                            for (int i = 0; i < simdLimit; i += vecSize)
+                            {
+                                var vX = *(Vector<float>*)(pXNorm + i);
+                                var vW = *(Vector<float>*)(pLmHead + rowOff + i);
+                                var vGrad = *(Vector<float>*)(pGrads + rowOff + i);
+                                var vDx = *(Vector<float>*)(pDxNorm + i);
+
+                                *(Vector<float>*)(pGrads + rowOff + i) = vGrad + (vDl * vX);
+                                *(Vector<float>*)(pDxNorm + i) = vDx + (vDl * vW);
+                            }
+
+                            for (int i = simdLimit; i < embDim; i++)
+                            {
+                                pGrads[rowOff + i] += dL * pXNorm[i];
+                                pDxNorm[i] += dL * pLmHead[rowOff + i];
+                            }
+                        }
                     }
                 }
 
@@ -786,31 +812,71 @@ namespace ZeroLlm.Core.Training
             }
         }
 
-        private static void MatVec(ReadOnlySpan<float> input, ReadOnlySpan<float> weight, int inDim, int outDim, Span<float> output)
+        private static unsafe void MatVec(ReadOnlySpan<float> input, ReadOnlySpan<float> weight, int inDim, int outDim, Span<float> output)
         {
-            for (int o = 0; o < outDim; o++)
+            fixed (float* pInput = input)
+            fixed (float* pWeight = weight)
+            fixed (float* pOutput = output)
             {
-                float dot = 0f;
-                int rowOff = o * inDim;
-                for (int i = 0; i < inDim; i++)
+                int vecSize = Vector<float>.Count;
+                int simdLimit = inDim - (inDim % vecSize);
+
+                for (int o = 0; o < outDim; o++)
                 {
-                    dot += input[i] * weight[rowOff + i];
+                    float* pRow = pWeight + (o * inDim);
+                    Vector<float> vSum = Vector<float>.Zero;
+
+                    for (int i = 0; i < simdLimit; i += vecSize)
+                    {
+                        var vIn = *(Vector<float>*)(pInput + i);
+                        var vW = *(Vector<float>*)(pRow + i);
+                        vSum += vIn * vW;
+                    }
+
+                    float dot = 0f;
+                    for (int j = 0; j < vecSize; j++) dot += vSum[j];
+
+                    for (int i = simdLimit; i < inDim; i++)
+                    {
+                        dot += pInput[i] * pRow[i];
+                    }
+
+                    pOutput[o] = dot;
                 }
-                output[o] = dot;
             }
         }
 
-        private static void MatVecAdd(ReadOnlySpan<float> input, ReadOnlySpan<float> weight, int inDim, int outDim, Span<float> accOutput)
+        private static unsafe void MatVecAdd(ReadOnlySpan<float> input, ReadOnlySpan<float> weight, int inDim, int outDim, Span<float> accOutput)
         {
-            for (int o = 0; o < outDim; o++)
+            fixed (float* pInput = input)
+            fixed (float* pWeight = weight)
+            fixed (float* pAcc = accOutput)
             {
-                float dot = 0f;
-                int rowOff = o * inDim;
-                for (int i = 0; i < inDim; i++)
+                int vecSize = Vector<float>.Count;
+                int simdLimit = inDim - (inDim % vecSize);
+
+                for (int o = 0; o < outDim; o++)
                 {
-                    dot += input[i] * weight[rowOff + i];
+                    float* pRow = pWeight + (o * inDim);
+                    Vector<float> vSum = Vector<float>.Zero;
+
+                    for (int i = 0; i < simdLimit; i += vecSize)
+                    {
+                        var vIn = *(Vector<float>*)(pInput + i);
+                        var vW = *(Vector<float>*)(pRow + i);
+                        vSum += vIn * vW;
+                    }
+
+                    float dot = 0f;
+                    for (int j = 0; j < vecSize; j++) dot += vSum[j];
+
+                    for (int i = simdLimit; i < inDim; i++)
+                    {
+                        dot += pInput[i] * pRow[i];
+                    }
+
+                    pAcc[o] += dot;
                 }
-                accOutput[o] += dot;
             }
         }
 
