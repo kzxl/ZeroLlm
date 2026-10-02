@@ -31,9 +31,16 @@ namespace ZeroLlm.Core.Quantization
                     float* bX = pX + (b * BlockQ8_0.BlockSize);
 
                     float blockSum = 0.0f;
-                    for (int i = 0; i < BlockQ8_0.BlockSize; i++)
+                    for (int i = 0; i < 32; i += 8)
                     {
-                        blockSum += bX[i] * block->Qs[i];
+                        blockSum += (bX[i] * block->Qs[i])
+                                  + (bX[i + 1] * block->Qs[i + 1])
+                                  + (bX[i + 2] * block->Qs[i + 2])
+                                  + (bX[i + 3] * block->Qs[i + 3])
+                                  + (bX[i + 4] * block->Qs[i + 4])
+                                  + (bX[i + 5] * block->Qs[i + 5])
+                                  + (bX[i + 6] * block->Qs[i + 6])
+                                  + (bX[i + 7] * block->Qs[i + 7]);
                     }
 
                     totalSum += blockSum * scale;
@@ -65,13 +72,17 @@ namespace ZeroLlm.Core.Quantization
                     float* bX = pX + (b * BlockQ4_0.BlockSize);
 
                     float blockSum = 0.0f;
-                    for (int i = 0; i < 16; i++)
+                    for (int i = 0; i < 16; i += 4)
                     {
-                        byte val = block->Qs[i];
-                        int q0 = (val & 0x0F) - 8;
-                        int q1 = (val >> 4) - 8;
+                        byte val0 = block->Qs[i];
+                        byte val1 = block->Qs[i + 1];
+                        byte val2 = block->Qs[i + 2];
+                        byte val3 = block->Qs[i + 3];
 
-                        blockSum += (bX[i] * q0) + (bX[i + 16] * q1);
+                        blockSum += (bX[i] * ((val0 & 0x0F) - 8)) + (bX[i + 16] * ((val0 >> 4) - 8))
+                                  + (bX[i + 1] * ((val1 & 0x0F) - 8)) + (bX[i + 17] * ((val1 >> 4) - 8))
+                                  + (bX[i + 2] * ((val2 & 0x0F) - 8)) + (bX[i + 18] * ((val2 >> 4) - 8))
+                                  + (bX[i + 3] * ((val3 & 0x0F) - 8)) + (bX[i + 19] * ((val3 >> 4) - 8));
                     }
 
                     totalSum += blockSum * scale;
