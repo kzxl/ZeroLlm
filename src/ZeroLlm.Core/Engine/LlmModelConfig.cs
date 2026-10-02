@@ -20,26 +20,39 @@ namespace ZeroLlm.Core.Engine
         public int EosTokenId { get; set; } = 2;
 
         /// <summary>
-        /// Creates a canonical configuration for the internal Vietnamese ERP Micro-SLM (~11.5M parameters).
+        /// Creates a canonical configuration for a generic Micro-SLM (~11.5M parameters).
         /// Tailored for high-speed sub-10ms CPU inference and compact memory footprint (~5.8MB INT4, ~11.5MB INT8).
         /// </summary>
-        public static LlmModelConfig CreateVietnameseErpMicro(int vocabSize = 16000, int contextLength = 1024)
+        public static LlmModelConfig CreateMicro(
+            int vocabSize = 16000,
+            int contextLength = 1024,
+            int embeddingDim = 256,
+            int layerCount = 6,
+            int headCount = 8,
+            int headCountKv = 2,
+            int feedForwardDim = 512)
         {
             return new LlmModelConfig
             {
                 Architecture = "llama",
                 VocabSize = vocabSize,
                 ContextLength = contextLength,
-                EmbeddingDim = 256,
-                LayerCount = 6,
-                HeadCount = 8,
-                HeadCountKv = 2,
-                FeedForwardDim = 512,
+                EmbeddingDim = embeddingDim,
+                LayerCount = layerCount,
+                HeadCount = headCount,
+                HeadCountKv = headCountKv,
+                FeedForwardDim = feedForwardDim,
                 RmsNormEps = 1e-5f,
                 RopeFreqBase = 10000.0f,
                 BosTokenId = 1,
                 EosTokenId = 2
             };
         }
+
+        /// <summary>
+        /// Convenience preset for the internal Vietnamese ERP Micro-SLM (~11.5M parameters).
+        /// </summary>
+        public static LlmModelConfig CreateVietnameseErpMicro(int vocabSize = 16000, int contextLength = 1024)
+            => CreateMicro(vocabSize, contextLength);
     }
 }
