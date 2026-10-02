@@ -5,6 +5,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using ZeroLlm.Core.Layers;
 using ZeroLlm.Core.Memory;
+using ZeroLlm.Core.Quantization;
 using ZeroLlm.Core.Sampling;
 using ZeroTokenizer.Core.Abstractions;
 
@@ -161,7 +162,28 @@ namespace ZeroLlm.Core.Engine
 
             // 1. Token Embedding lookup
             int safeTokenId = (tokenId >= 0 && tokenId < cfg.VocabSize) ? tokenId : 0;
-            new ReadOnlySpan<float>(_model.TokenEmbeddings, safeTokenId * embDim, embDim).CopyTo(x);
+            if (_model.TokenEmbeddings_Q8 != null)
+            {
+                int blocksPerToken = embDim / BlockQ8_0.BlockSize;
+                int blockOffset = safeTokenId * blocksPerToken;
+                for (int b = 0; b < blocksPerToken; b++)
+                {
+                    _model.TokenEmbeddings_Q8[blockOffset + b].Dequantize(x.Slice(b * BlockQ8_0.BlockSize, BlockQ8_0.BlockSize));
+                }
+            }
+            else if (_model.TokenEmbeddings_Q4 != null)
+            {
+                int blocksPerToken = embDim / BlockQ4_0.BlockSize;
+                int blockOffset = safeTokenId * blocksPerToken;
+                for (int b = 0; b < blocksPerToken; b++)
+                {
+                    _model.TokenEmbeddings_Q4[blockOffset + b].Dequantize(x.Slice(b * BlockQ4_0.BlockSize, BlockQ4_0.BlockSize));
+                }
+            }
+            else
+            {
+                new ReadOnlySpan<float>(_model.TokenEmbeddings, safeTokenId * embDim, embDim).CopyTo(x);
+            }
 
             // 2. Transformer Layers
             for (int l = 0; l < cfg.LayerCount; l++)
@@ -172,9 +194,17 @@ namespace ZeroLlm.Core.Engine
                 RmsNorm.Forward(x, layer.AttnNorm, xNorm, cfg.RmsNormEps);
 
                 // Q, K, V Projections (Matrix x Vector)
-                MatVec(xNorm, layer.Wq, embDim, qDim, q);
-                MatVec(xNorm, layer.Wk, embDim, kvDim, k);
-                MatVec(xNorm, layer.Wv, embDim, kvDim, v);
+                if (layer.Wq_Q8 != null) QuantizedKernels.MatVecMulQ8_0(layer.Wq_Q8, xNorm, q, qDim, embDim);
+                else if (layer.Wq_Q4 != null) QuantizedKernels.MatVecMulQ4_0(layer.Wq_Q4, xNorm, q, qDim, embDim);
+                else MatVec(xNorm, layer.Wq, embDim, qDim, q);
+
+                if (layer.Wk_Q8 != null) QuantizedKernels.MatVecMulQ8_0(layer.Wk_Q8, xNorm, k, kvDim, embDim);
+                else if (layer.Wk_Q4 != null) QuantizedKernels.MatVecMulQ4_0(layer.Wk_Q4, xNorm, k, kvDim, embDim);
+                else MatVec(xNorm, layer.Wk, embDim, kvDim, k);
+
+                if (layer.Wv_Q8 != null) QuantizedKernels.MatVecMulQ8_0(layer.Wv_Q8, xNorm, v, kvDim, embDim);
+                else if (layer.Wv_Q4 != null) QuantizedKernels.MatVecMulQ4_0(layer.Wv_Q4, xNorm, v, kvDim, embDim);
+                else MatVec(xNorm, layer.Wv, embDim, kvDim, v);
 
                 // RoPE on Q and K
                 for (int h = 0; h < cfg.HeadCount; h++)
@@ -193,25 +223,37 @@ namespace ZeroLlm.Core.Engine
                 GqaAttention.Forward(q, seqId, l, _kvCache, cfg.HeadCount, cfg.HeadCountKv, headDim, attnOut);
 
                 // Output projection + Residual Add
-                MatVecAdd(attnOut, layer.Wo, qDim, embDim, x);
+                if (layer.Wo_Q8 != null) QuantizedKernels.MatVecAddQ8_0(layer.Wo_Q8, attnOut, x, embDim, qDim);
+                else if (layer.Wo_Q4 != null) QuantizedKernels.MatVecAddQ4_0(layer.Wo_Q4, attnOut, x, embDim, qDim);
+                else MatVecAdd(attnOut, layer.Wo, qDim, embDim, x);
 
                 // FFN RMSNorm
                 RmsNorm.Forward(x, layer.FfnNorm, xNorm, cfg.RmsNormEps);
 
                 // SwiGLU FFN
-                MatVec(xNorm, layer.Wgate, embDim, cfg.FeedForwardDim, gate);
-                MatVec(xNorm, layer.Wup, embDim, cfg.FeedForwardDim, up);
+                if (layer.Wgate_Q8 != null) QuantizedKernels.MatVecMulQ8_0(layer.Wgate_Q8, xNorm, gate, cfg.FeedForwardDim, embDim);
+                else if (layer.Wgate_Q4 != null) QuantizedKernels.MatVecMulQ4_0(layer.Wgate_Q4, xNorm, gate, cfg.FeedForwardDim, embDim);
+                else MatVec(xNorm, layer.Wgate, embDim, cfg.FeedForwardDim, gate);
+
+                if (layer.Wup_Q8 != null) QuantizedKernels.MatVecMulQ8_0(layer.Wup_Q8, xNorm, up, cfg.FeedForwardDim, embDim);
+                else if (layer.Wup_Q4 != null) QuantizedKernels.MatVecMulQ4_0(layer.Wup_Q4, xNorm, up, cfg.FeedForwardDim, embDim);
+                else MatVec(xNorm, layer.Wup, embDim, cfg.FeedForwardDim, up);
+
                 SwiGLU.Forward(gate, up, swiglu);
 
                 // Down projection + Residual Add
-                MatVecAdd(swiglu, layer.Wdown, cfg.FeedForwardDim, embDim, x);
+                if (layer.Wdown_Q8 != null) QuantizedKernels.MatVecAddQ8_0(layer.Wdown_Q8, swiglu, x, embDim, cfg.FeedForwardDim);
+                else if (layer.Wdown_Q4 != null) QuantizedKernels.MatVecAddQ4_0(layer.Wdown_Q4, swiglu, x, embDim, cfg.FeedForwardDim);
+                else MatVecAdd(swiglu, layer.Wdown, cfg.FeedForwardDim, embDim, x);
             }
 
             // 3. Final RMSNorm
             RmsNorm.Forward(x, _model.FinalNorm, xNorm, cfg.RmsNormEps);
 
             // 4. LM Head (Logits projection)
-            MatVec(xNorm, _model.LmHead, embDim, cfg.VocabSize, logits);
+            if (_model.LmHead_Q8 != null) QuantizedKernels.MatVecMulQ8_0(_model.LmHead_Q8, xNorm, logits, cfg.VocabSize, embDim);
+            else if (_model.LmHead_Q4 != null) QuantizedKernels.MatVecMulQ4_0(_model.LmHead_Q4, xNorm, logits, cfg.VocabSize, embDim);
+            else MatVec(xNorm, _model.LmHead, embDim, cfg.VocabSize, logits);
         }
 
         private static void MatVec(ReadOnlySpan<float> input, ReadOnlySpan<float> weight, int inDim, int outDim, Span<float> output)

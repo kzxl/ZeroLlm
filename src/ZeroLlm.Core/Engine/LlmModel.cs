@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using ZeroLlm.Core.Format;
+using ZeroLlm.Core.Quantization;
 
 namespace ZeroLlm.Core.Engine
 {
@@ -16,6 +17,24 @@ namespace ZeroLlm.Core.Engine
         public float[] Wgate { get; set; } = Array.Empty<float>();
         public float[] Wup { get; set; } = Array.Empty<float>();
         public float[] Wdown { get; set; } = Array.Empty<float>();
+
+        // Quantized 8-bit representations (Q8_0)
+        public BlockQ8_0[]? Wq_Q8 { get; set; }
+        public BlockQ8_0[]? Wk_Q8 { get; set; }
+        public BlockQ8_0[]? Wv_Q8 { get; set; }
+        public BlockQ8_0[]? Wo_Q8 { get; set; }
+        public BlockQ8_0[]? Wgate_Q8 { get; set; }
+        public BlockQ8_0[]? Wup_Q8 { get; set; }
+        public BlockQ8_0[]? Wdown_Q8 { get; set; }
+
+        // Quantized 4-bit representations (Q4_0)
+        public BlockQ4_0[]? Wq_Q4 { get; set; }
+        public BlockQ4_0[]? Wk_Q4 { get; set; }
+        public BlockQ4_0[]? Wv_Q4 { get; set; }
+        public BlockQ4_0[]? Wo_Q4 { get; set; }
+        public BlockQ4_0[]? Wgate_Q4 { get; set; }
+        public BlockQ4_0[]? Wup_Q4 { get; set; }
+        public BlockQ4_0[]? Wdown_Q4 { get; set; }
     }
 
     /// <summary>
@@ -24,10 +43,19 @@ namespace ZeroLlm.Core.Engine
     public sealed class LlmModel
     {
         public LlmModelConfig Config { get; }
+        public GgufTensorType QuantizationType { get; set; } = GgufTensorType.F32;
+        public bool IsQuantized => QuantizationType != GgufTensorType.F32;
+
         public float[] TokenEmbeddings { get; set; } = Array.Empty<float>();
+        public BlockQ8_0[]? TokenEmbeddings_Q8 { get; set; }
+        public BlockQ4_0[]? TokenEmbeddings_Q4 { get; set; }
+
         public LlmLayerWeights[] Layers { get; set; } = Array.Empty<LlmLayerWeights>();
         public float[] FinalNorm { get; set; } = Array.Empty<float>();
+
         public float[] LmHead { get; set; } = Array.Empty<float>();
+        public BlockQ8_0[]? LmHead_Q8 { get; set; }
+        public BlockQ4_0[]? LmHead_Q4 { get; set; }
 
         public LlmModel(LlmModelConfig config)
         {
@@ -96,10 +124,9 @@ namespace ZeroLlm.Core.Engine
 
             // Tensors
             // 1. Embeddings
-            writer.AddTensor("token_embd.weight",
+            WriteTensor(writer, "token_embd.weight",
                 new ulong[] { (ulong)Config.EmbeddingDim, (ulong)Config.VocabSize },
-                GgufTensorType.F32,
-                FloatArrayToBytes(TokenEmbeddings));
+                TokenEmbeddings, TokenEmbeddings_Q8, TokenEmbeddings_Q4);
 
             // 2. Layers
             int qDim = Config.HeadCount * Config.HeadDim;
@@ -109,19 +136,19 @@ namespace ZeroLlm.Core.Engine
             {
                 var layer = Layers[l];
                 writer.AddTensor($"blk.{l}.attn_norm.weight", new ulong[] { (ulong)Config.EmbeddingDim }, GgufTensorType.F32, FloatArrayToBytes(layer.AttnNorm));
-                writer.AddTensor($"blk.{l}.attn_q.weight", new ulong[] { (ulong)Config.EmbeddingDim, (ulong)qDim }, GgufTensorType.F32, FloatArrayToBytes(layer.Wq));
-                writer.AddTensor($"blk.{l}.attn_k.weight", new ulong[] { (ulong)Config.EmbeddingDim, (ulong)kvDim }, GgufTensorType.F32, FloatArrayToBytes(layer.Wk));
-                writer.AddTensor($"blk.{l}.attn_v.weight", new ulong[] { (ulong)Config.EmbeddingDim, (ulong)kvDim }, GgufTensorType.F32, FloatArrayToBytes(layer.Wv));
-                writer.AddTensor($"blk.{l}.attn_output.weight", new ulong[] { (ulong)qDim, (ulong)Config.EmbeddingDim }, GgufTensorType.F32, FloatArrayToBytes(layer.Wo));
+                WriteTensor(writer, $"blk.{l}.attn_q.weight", new ulong[] { (ulong)Config.EmbeddingDim, (ulong)qDim }, layer.Wq, layer.Wq_Q8, layer.Wq_Q4);
+                WriteTensor(writer, $"blk.{l}.attn_k.weight", new ulong[] { (ulong)Config.EmbeddingDim, (ulong)kvDim }, layer.Wk, layer.Wk_Q8, layer.Wk_Q4);
+                WriteTensor(writer, $"blk.{l}.attn_v.weight", new ulong[] { (ulong)Config.EmbeddingDim, (ulong)kvDim }, layer.Wv, layer.Wv_Q8, layer.Wv_Q4);
+                WriteTensor(writer, $"blk.{l}.attn_output.weight", new ulong[] { (ulong)qDim, (ulong)Config.EmbeddingDim }, layer.Wo, layer.Wo_Q8, layer.Wo_Q4);
                 writer.AddTensor($"blk.{l}.ffn_norm.weight", new ulong[] { (ulong)Config.EmbeddingDim }, GgufTensorType.F32, FloatArrayToBytes(layer.FfnNorm));
-                writer.AddTensor($"blk.{l}.ffn_gate.weight", new ulong[] { (ulong)Config.EmbeddingDim, (ulong)Config.FeedForwardDim }, GgufTensorType.F32, FloatArrayToBytes(layer.Wgate));
-                writer.AddTensor($"blk.{l}.ffn_up.weight", new ulong[] { (ulong)Config.EmbeddingDim, (ulong)Config.FeedForwardDim }, GgufTensorType.F32, FloatArrayToBytes(layer.Wup));
-                writer.AddTensor($"blk.{l}.ffn_down.weight", new ulong[] { (ulong)Config.FeedForwardDim, (ulong)Config.EmbeddingDim }, GgufTensorType.F32, FloatArrayToBytes(layer.Wdown));
+                WriteTensor(writer, $"blk.{l}.ffn_gate.weight", new ulong[] { (ulong)Config.EmbeddingDim, (ulong)Config.FeedForwardDim }, layer.Wgate, layer.Wgate_Q8, layer.Wgate_Q4);
+                WriteTensor(writer, $"blk.{l}.ffn_up.weight", new ulong[] { (ulong)Config.EmbeddingDim, (ulong)Config.FeedForwardDim }, layer.Wup, layer.Wup_Q8, layer.Wup_Q4);
+                WriteTensor(writer, $"blk.{l}.ffn_down.weight", new ulong[] { (ulong)Config.FeedForwardDim, (ulong)Config.EmbeddingDim }, layer.Wdown, layer.Wdown_Q8, layer.Wdown_Q4);
             }
 
             // 3. Final norm & LM head
             writer.AddTensor("output_norm.weight", new ulong[] { (ulong)Config.EmbeddingDim }, GgufTensorType.F32, FloatArrayToBytes(FinalNorm));
-            writer.AddTensor("output.weight", new ulong[] { (ulong)Config.EmbeddingDim, (ulong)Config.VocabSize }, GgufTensorType.F32, FloatArrayToBytes(LmHead));
+            WriteTensor(writer, "output.weight", new ulong[] { (ulong)Config.EmbeddingDim, (ulong)Config.VocabSize }, LmHead, LmHead_Q8, LmHead_Q4);
 
             writer.WriteTo(stream);
         }
@@ -191,29 +218,57 @@ namespace ZeroLlm.Core.Engine
             };
 
             if (tensorMap.TryGetValue("token_embd.weight", out var tEmb))
-                model.TokenEmbeddings = ReadTensorFloats(stream, reader.TensorDataOffset, tEmb);
+            {
+                LoadTensor(stream, reader.TensorDataOffset, tEmb, out var f32, out var q8, out var q4);
+                model.TokenEmbeddings = f32;
+                model.TokenEmbeddings_Q8 = q8;
+                model.TokenEmbeddings_Q4 = q4;
+            }
 
             for (int l = 0; l < layerCount; l++)
             {
                 var layer = new LlmLayerWeights();
                 if (tensorMap.TryGetValue($"blk.{l}.attn_norm.weight", out var tAttnNorm))
                     layer.AttnNorm = ReadTensorFloats(stream, reader.TensorDataOffset, tAttnNorm);
+
                 if (tensorMap.TryGetValue($"blk.{l}.attn_q.weight", out var tWq))
-                    layer.Wq = ReadTensorFloats(stream, reader.TensorDataOffset, tWq);
+                {
+                    LoadTensor(stream, reader.TensorDataOffset, tWq, out var f32, out var q8, out var q4);
+                    layer.Wq = f32; layer.Wq_Q8 = q8; layer.Wq_Q4 = q4;
+                }
                 if (tensorMap.TryGetValue($"blk.{l}.attn_k.weight", out var tWk))
-                    layer.Wk = ReadTensorFloats(stream, reader.TensorDataOffset, tWk);
+                {
+                    LoadTensor(stream, reader.TensorDataOffset, tWk, out var f32, out var q8, out var q4);
+                    layer.Wk = f32; layer.Wk_Q8 = q8; layer.Wk_Q4 = q4;
+                }
                 if (tensorMap.TryGetValue($"blk.{l}.attn_v.weight", out var tWv))
-                    layer.Wv = ReadTensorFloats(stream, reader.TensorDataOffset, tWv);
+                {
+                    LoadTensor(stream, reader.TensorDataOffset, tWv, out var f32, out var q8, out var q4);
+                    layer.Wv = f32; layer.Wv_Q8 = q8; layer.Wv_Q4 = q4;
+                }
                 if (tensorMap.TryGetValue($"blk.{l}.attn_output.weight", out var tWo))
-                    layer.Wo = ReadTensorFloats(stream, reader.TensorDataOffset, tWo);
+                {
+                    LoadTensor(stream, reader.TensorDataOffset, tWo, out var f32, out var q8, out var q4);
+                    layer.Wo = f32; layer.Wo_Q8 = q8; layer.Wo_Q4 = q4;
+                }
                 if (tensorMap.TryGetValue($"blk.{l}.ffn_norm.weight", out var tFfnNorm))
                     layer.FfnNorm = ReadTensorFloats(stream, reader.TensorDataOffset, tFfnNorm);
+
                 if (tensorMap.TryGetValue($"blk.{l}.ffn_gate.weight", out var tWgate))
-                    layer.Wgate = ReadTensorFloats(stream, reader.TensorDataOffset, tWgate);
+                {
+                    LoadTensor(stream, reader.TensorDataOffset, tWgate, out var f32, out var q8, out var q4);
+                    layer.Wgate = f32; layer.Wgate_Q8 = q8; layer.Wgate_Q4 = q4;
+                }
                 if (tensorMap.TryGetValue($"blk.{l}.ffn_up.weight", out var tWup))
-                    layer.Wup = ReadTensorFloats(stream, reader.TensorDataOffset, tWup);
+                {
+                    LoadTensor(stream, reader.TensorDataOffset, tWup, out var f32, out var q8, out var q4);
+                    layer.Wup = f32; layer.Wup_Q8 = q8; layer.Wup_Q4 = q4;
+                }
                 if (tensorMap.TryGetValue($"blk.{l}.ffn_down.weight", out var tWdown))
-                    layer.Wdown = ReadTensorFloats(stream, reader.TensorDataOffset, tWdown);
+                {
+                    LoadTensor(stream, reader.TensorDataOffset, tWdown, out var f32, out var q8, out var q4);
+                    layer.Wdown = f32; layer.Wdown_Q8 = q8; layer.Wdown_Q4 = q4;
+                }
 
                 model.Layers[l] = layer;
             }
@@ -222,9 +277,24 @@ namespace ZeroLlm.Core.Engine
                 model.FinalNorm = ReadTensorFloats(stream, reader.TensorDataOffset, tFinalNorm);
 
             if (tensorMap.TryGetValue("output.weight", out var tLmHead))
-                model.LmHead = ReadTensorFloats(stream, reader.TensorDataOffset, tLmHead);
+            {
+                LoadTensor(stream, reader.TensorDataOffset, tLmHead, out var f32, out var q8, out var q4);
+                model.LmHead = f32;
+                model.LmHead_Q8 = q8;
+                model.LmHead_Q4 = q4;
+            }
             else
+            {
                 model.LmHead = model.TokenEmbeddings; // Tied weights fallback
+                model.LmHead_Q8 = model.TokenEmbeddings_Q8;
+                model.LmHead_Q4 = model.TokenEmbeddings_Q4;
+            }
+
+            bool hasQ4 = model.TokenEmbeddings_Q4 != null || (model.Layers.Length > 0 && model.Layers[0].Wq_Q4 != null);
+            bool hasQ8 = model.TokenEmbeddings_Q8 != null || (model.Layers.Length > 0 && model.Layers[0].Wq_Q8 != null);
+            if (hasQ4) model.QuantizationType = GgufTensorType.Q4_0;
+            else if (hasQ8) model.QuantizationType = GgufTensorType.Q8_0;
+            else model.QuantizationType = GgufTensorType.F32;
 
             return model;
         }
@@ -252,7 +322,57 @@ namespace ZeroLlm.Core.Engine
             return floats;
         }
 
-        private static float[] ReadTensorFloats(Stream stream, long tensorDataOffset, GgufTensorInfo tensor)
+        private static void WriteTensor(
+            GgufWriter writer,
+            string name,
+            ulong[] dims,
+            float[]? f32,
+            BlockQ8_0[]? q8,
+            BlockQ4_0[]? q4)
+        {
+            if (q8 != null && q8.Length > 0)
+            {
+                writer.AddTensor(name, dims, GgufTensorType.Q8_0, LlmQuantizer.Q8BlocksToBytes(q8));
+            }
+            else if (q4 != null && q4.Length > 0)
+            {
+                writer.AddTensor(name, dims, GgufTensorType.Q4_0, LlmQuantizer.Q4BlocksToBytes(q4));
+            }
+            else if (f32 != null && f32.Length > 0)
+            {
+                writer.AddTensor(name, dims, GgufTensorType.F32, FloatArrayToBytes(f32));
+            }
+        }
+
+        private static void LoadTensor(
+            Stream stream,
+            long tensorDataOffset,
+            GgufTensorInfo tensor,
+            out float[] f32,
+            out BlockQ8_0[]? q8,
+            out BlockQ4_0[]? q4)
+        {
+            f32 = Array.Empty<float>();
+            q8 = null;
+            q4 = null;
+
+            byte[] bytes = ReadTensorBytes(stream, tensorDataOffset, tensor);
+            switch (tensor.Type)
+            {
+                case GgufTensorType.Q8_0:
+                    q8 = LlmQuantizer.BytesToQ8Blocks(bytes);
+                    break;
+                case GgufTensorType.Q4_0:
+                    q4 = LlmQuantizer.BytesToQ4Blocks(bytes);
+                    break;
+                case GgufTensorType.F32:
+                default:
+                    f32 = BytesToFloatArray(bytes);
+                    break;
+            }
+        }
+
+        private static byte[] ReadTensorBytes(Stream stream, long tensorDataOffset, GgufTensorInfo tensor)
         {
             stream.Seek(tensorDataOffset + (long)tensor.Offset, SeekOrigin.Begin);
             int byteLen = (int)tensor.GetSizeInBytes();
@@ -264,6 +384,12 @@ namespace ZeroLlm.Core.Engine
                 if (r <= 0) break;
                 read += r;
             }
+            return bytes;
+        }
+
+        private static float[] ReadTensorFloats(Stream stream, long tensorDataOffset, GgufTensorInfo tensor)
+        {
+            byte[] bytes = ReadTensorBytes(stream, tensorDataOffset, tensor);
             return BytesToFloatArray(bytes);
         }
 

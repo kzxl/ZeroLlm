@@ -122,5 +122,47 @@ namespace ZeroLlm.Core.Quantization
                 y[r] = DotProductQ4_0(x, rowBlocks);
             }
         }
+
+        /// <summary>
+        /// Multiplies a matrix of Q8_0 blocks with a float vector x, accumulating into destination vector y: y += W * x.
+        /// </summary>
+        public static void MatVecAddQ8_0(
+            ReadOnlySpan<BlockQ8_0> weightMatrix,
+            ReadOnlySpan<float> x,
+            Span<float> y,
+            int rows,
+            int cols)
+        {
+            int blocksPerRow = cols / BlockQ8_0.BlockSize;
+            if (weightMatrix.Length < rows * blocksPerRow)
+                throw new ArgumentException("Weight matrix dimension mismatch.");
+
+            for (int r = 0; r < rows; r++)
+            {
+                var rowBlocks = weightMatrix.Slice(r * blocksPerRow, blocksPerRow);
+                y[r] += DotProductQ8_0(x, rowBlocks);
+            }
+        }
+
+        /// <summary>
+        /// Multiplies a matrix of Q4_0 blocks with a float vector x, accumulating into destination vector y: y += W * x.
+        /// </summary>
+        public static void MatVecAddQ4_0(
+            ReadOnlySpan<BlockQ4_0> weightMatrix,
+            ReadOnlySpan<float> x,
+            Span<float> y,
+            int rows,
+            int cols)
+        {
+            int blocksPerRow = cols / BlockQ4_0.BlockSize;
+            if (weightMatrix.Length < rows * blocksPerRow)
+                throw new ArgumentException("Weight matrix dimension mismatch.");
+
+            for (int r = 0; r < rows; r++)
+            {
+                var rowBlocks = weightMatrix.Slice(r * blocksPerRow, blocksPerRow);
+                y[r] += DotProductQ4_0(x, rowBlocks);
+            }
+        }
     }
 }
