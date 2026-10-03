@@ -61,6 +61,10 @@ namespace ZeroLlm.Core.Training
             public ParamGrad[]? ExpertWup { get; }
             public ParamGrad[]? ExpertWdown { get; }
 
+            public ParamGrad[]? SharedExpertWgate { get; }
+            public ParamGrad[]? SharedExpertWup { get; }
+            public ParamGrad[]? SharedExpertWdown { get; }
+
             public LayerParamGrad(LlmLayerWeights layer)
             {
                 AttnNorm = new ParamGrad(layer.AttnNorm);
@@ -71,18 +75,35 @@ namespace ZeroLlm.Core.Training
                 FfnNorm = new ParamGrad(layer.FfnNorm);
                 IsMoE = layer.IsMoE;
 
-                if (layer.IsMoE && layer.Experts != null && layer.Experts.Length > 0)
+                if (layer.IsMoE)
                 {
-                    Wrouter = new ParamGrad(layer.Wrouter ?? new float[layer.Experts.Length * layer.AttnNorm.Length]);
-                    ExpertWgate = new ParamGrad[layer.Experts.Length];
-                    ExpertWup = new ParamGrad[layer.Experts.Length];
-                    ExpertWdown = new ParamGrad[layer.Experts.Length];
-
-                    for (int e = 0; e < layer.Experts.Length; e++)
+                    if (layer.Experts != null && layer.Experts.Length > 0)
                     {
-                        ExpertWgate[e] = new ParamGrad(layer.Experts[e].Wgate);
-                        ExpertWup[e] = new ParamGrad(layer.Experts[e].Wup);
-                        ExpertWdown[e] = new ParamGrad(layer.Experts[e].Wdown);
+                        Wrouter = new ParamGrad(layer.Wrouter ?? new float[layer.Experts.Length * layer.AttnNorm.Length]);
+                        ExpertWgate = new ParamGrad[layer.Experts.Length];
+                        ExpertWup = new ParamGrad[layer.Experts.Length];
+                        ExpertWdown = new ParamGrad[layer.Experts.Length];
+
+                        for (int e = 0; e < layer.Experts.Length; e++)
+                        {
+                            ExpertWgate[e] = new ParamGrad(layer.Experts[e].Wgate);
+                            ExpertWup[e] = new ParamGrad(layer.Experts[e].Wup);
+                            ExpertWdown[e] = new ParamGrad(layer.Experts[e].Wdown);
+                        }
+                    }
+
+                    if (layer.SharedExperts != null && layer.SharedExperts.Length > 0)
+                    {
+                        SharedExpertWgate = new ParamGrad[layer.SharedExperts.Length];
+                        SharedExpertWup = new ParamGrad[layer.SharedExperts.Length];
+                        SharedExpertWdown = new ParamGrad[layer.SharedExperts.Length];
+
+                        for (int se = 0; se < layer.SharedExperts.Length; se++)
+                        {
+                            SharedExpertWgate[se] = new ParamGrad(layer.SharedExperts[se].Wgate);
+                            SharedExpertWup[se] = new ParamGrad(layer.SharedExperts[se].Wup);
+                            SharedExpertWdown[se] = new ParamGrad(layer.SharedExperts[se].Wdown);
+                        }
                     }
                 }
                 else
@@ -102,14 +123,26 @@ namespace ZeroLlm.Core.Training
                 list.Add(Wo);
                 list.Add(FfnNorm);
 
-                if (IsMoE && ExpertWgate != null)
+                if (IsMoE)
                 {
                     if (Wrouter != null) list.Add(Wrouter);
-                    for (int e = 0; e < ExpertWgate.Length; e++)
+                    if (ExpertWgate != null)
                     {
-                        list.Add(ExpertWgate[e]);
-                        list.Add(ExpertWup![e]);
-                        list.Add(ExpertWdown![e]);
+                        for (int e = 0; e < ExpertWgate.Length; e++)
+                        {
+                            list.Add(ExpertWgate[e]);
+                            list.Add(ExpertWup![e]);
+                            list.Add(ExpertWdown![e]);
+                        }
+                    }
+                    if (SharedExpertWgate != null)
+                    {
+                        for (int se = 0; se < SharedExpertWgate.Length; se++)
+                        {
+                            list.Add(SharedExpertWgate[se]);
+                            list.Add(SharedExpertWup![se]);
+                            list.Add(SharedExpertWdown![se]);
+                        }
                     }
                 }
                 else
@@ -229,6 +262,10 @@ namespace ZeroLlm.Core.Training
             float[][][][] moeSwiglu = hasMoE ? new float[numPositions][][][] : null!;
             float[][][][] moeDown = hasMoE ? new float[numPositions][][][] : null!;
             float[][][] moeRouterLogits = hasMoE ? new float[numPositions][][] : null!;
+            float[][][][] moeSharedGate = hasMoE ? new float[numPositions][][][] : null!;
+            float[][][][] moeSharedUp = hasMoE ? new float[numPositions][][][] : null!;
+            float[][][][] moeSharedSwiglu = hasMoE ? new float[numPositions][][][] : null!;
+            float[][][][] moeSharedDown = hasMoE ? new float[numPositions][][][] : null!;
 
             float[][] xNormFinal = new float[numPositions][];
             float[][] logits = new float[numPositions][];
@@ -260,6 +297,10 @@ namespace ZeroLlm.Core.Training
                     moeSwiglu[pos] = new float[layers][][];
                     moeDown[pos] = new float[layers][][];
                     moeRouterLogits[pos] = new float[layers][];
+                    moeSharedGate[pos] = new float[layers][][];
+                    moeSharedUp[pos] = new float[layers][][];
+                    moeSharedSwiglu[pos] = new float[layers][][];
+                    moeSharedDown[pos] = new float[layers][][];
                 }
 
                 xNormFinal[pos] = new float[embDim];
@@ -318,47 +359,80 @@ namespace ZeroLlm.Core.Training
                     // FFN RMSNorm
                     RmsNorm.Forward(xMid[pos][l], layer.FfnNorm, xNormFfn[pos][l], cfg.RmsNormEps);
 
-                    if (layer.IsMoE && layer.Experts != null && layer.Experts.Length > 0)
+                    if (layer.IsMoE)
                     {
-                        int expCount = layer.Experts.Length;
-                        int kUsed = Math.Min(Math.Max(1, cfg.ExpertUsedCount), expCount);
-
-                        moeTopIndices[pos][l] = new int[kUsed];
-                        moeTopWeights[pos][l] = new float[kUsed];
-                        moeGate[pos][l] = new float[kUsed][];
-                        moeUp[pos][l] = new float[kUsed][];
-                        moeSwiglu[pos][l] = new float[kUsed][];
-                        moeDown[pos][l] = new float[kUsed][];
-                        moeRouterLogits[pos][l] = new float[expCount];
-
-                        // Router Logits
-                        MatVec(xNormFfn[pos][l], layer.Wrouter!, embDim, expCount, moeRouterLogits[pos][l]);
-
-                        // Top-K selection
-                        SelectTopK(moeRouterLogits[pos][l], moeTopIndices[pos][l], moeTopWeights[pos][l], kUsed);
-                        ComputeSoftmax(moeTopWeights[pos][l]);
-
                         Array.Copy(xMid[pos][l], xOut[pos][l], embDim);
 
-                        for (int ki = 0; ki < kUsed; ki++)
+                        // 1. Shared Experts (DeepSeek / Qwen style: always active)
+                        if (layer.SharedExperts != null && layer.SharedExperts.Length > 0)
                         {
-                            int expIdx = moeTopIndices[pos][l][ki];
-                            float w = moeTopWeights[pos][l][ki];
-                            var exp = layer.Experts[expIdx];
+                            int seCount = layer.SharedExperts.Length;
+                            moeSharedGate[pos][l] = new float[seCount][];
+                            moeSharedUp[pos][l] = new float[seCount][];
+                            moeSharedSwiglu[pos][l] = new float[seCount][];
+                            moeSharedDown[pos][l] = new float[seCount][];
 
-                            moeGate[pos][l][ki] = new float[ffnDim];
-                            moeUp[pos][l][ki] = new float[ffnDim];
-                            moeSwiglu[pos][l][ki] = new float[ffnDim];
-                            moeDown[pos][l][ki] = new float[embDim];
-
-                            MatVec(xNormFfn[pos][l], exp.Wgate, embDim, ffnDim, moeGate[pos][l][ki]);
-                            MatVec(xNormFfn[pos][l], exp.Wup, embDim, ffnDim, moeUp[pos][l][ki]);
-                            SwiGLU.Forward(moeGate[pos][l][ki], moeUp[pos][l][ki], moeSwiglu[pos][l][ki]);
-                            MatVec(moeSwiglu[pos][l][ki], exp.Wdown, ffnDim, embDim, moeDown[pos][l][ki]);
-
-                            for (int d = 0; d < embDim; d++)
+                            for (int se = 0; se < seCount; se++)
                             {
-                                xOut[pos][l][d] += w * moeDown[pos][l][ki][d];
+                                var sExp = layer.SharedExperts[se];
+                                moeSharedGate[pos][l][se] = new float[ffnDim];
+                                moeSharedUp[pos][l][se] = new float[ffnDim];
+                                moeSharedSwiglu[pos][l][se] = new float[ffnDim];
+                                moeSharedDown[pos][l][se] = new float[embDim];
+
+                                MatVec(xNormFfn[pos][l], sExp.Wgate, embDim, ffnDim, moeSharedGate[pos][l][se]);
+                                MatVec(xNormFfn[pos][l], sExp.Wup, embDim, ffnDim, moeSharedUp[pos][l][se]);
+                                SwiGLU.Forward(moeSharedGate[pos][l][se], moeSharedUp[pos][l][se], moeSharedSwiglu[pos][l][se]);
+                                MatVec(moeSharedSwiglu[pos][l][se], sExp.Wdown, ffnDim, embDim, moeSharedDown[pos][l][se]);
+
+                                for (int d = 0; d < embDim; d++)
+                                {
+                                    xOut[pos][l][d] += moeSharedDown[pos][l][se][d];
+                                }
+                            }
+                        }
+
+                        // 2. Routed Top-K Experts
+                        if (layer.Experts != null && layer.Experts.Length > 0)
+                        {
+                            int expCount = layer.Experts.Length;
+                            int kUsed = Math.Min(Math.Max(1, cfg.ExpertUsedCount), expCount);
+
+                            moeTopIndices[pos][l] = new int[kUsed];
+                            moeTopWeights[pos][l] = new float[kUsed];
+                            moeGate[pos][l] = new float[kUsed][];
+                            moeUp[pos][l] = new float[kUsed][];
+                            moeSwiglu[pos][l] = new float[kUsed][];
+                            moeDown[pos][l] = new float[kUsed][];
+                            moeRouterLogits[pos][l] = new float[expCount];
+
+                            // Router Logits
+                            MatVec(xNormFfn[pos][l], layer.Wrouter!, embDim, expCount, moeRouterLogits[pos][l]);
+
+                            // Top-K selection
+                            SelectTopK(moeRouterLogits[pos][l], moeTopIndices[pos][l], moeTopWeights[pos][l], kUsed);
+                            ComputeSoftmax(moeTopWeights[pos][l]);
+
+                            for (int ki = 0; ki < kUsed; ki++)
+                            {
+                                int expIdx = moeTopIndices[pos][l][ki];
+                                float w = moeTopWeights[pos][l][ki];
+                                var exp = layer.Experts[expIdx];
+
+                                moeGate[pos][l][ki] = new float[ffnDim];
+                                moeUp[pos][l][ki] = new float[ffnDim];
+                                moeSwiglu[pos][l][ki] = new float[ffnDim];
+                                moeDown[pos][l][ki] = new float[embDim];
+
+                                MatVec(xNormFfn[pos][l], exp.Wgate, embDim, ffnDim, moeGate[pos][l][ki]);
+                                MatVec(xNormFfn[pos][l], exp.Wup, embDim, ffnDim, moeUp[pos][l][ki]);
+                                SwiGLU.Forward(moeGate[pos][l][ki], moeUp[pos][l][ki], moeSwiglu[pos][l][ki]);
+                                MatVec(moeSwiglu[pos][l][ki], exp.Wdown, ffnDim, embDim, moeDown[pos][l][ki]);
+
+                                for (int d = 0; d < embDim; d++)
+                                {
+                                    xOut[pos][l][d] += w * moeDown[pos][l][ki][d];
+                                }
                             }
                         }
                     }
@@ -540,93 +614,148 @@ namespace ZeroLlm.Core.Training
                     var layer = _model.Layers[l];
                     var lParams = _layerParams[l];
 
-                    if (layer.IsMoE && layer.Experts != null && layer.Experts.Length > 0)
+                    if (layer.IsMoE)
                     {
-                        int expCount = layer.Experts.Length;
-                        int kUsed = moeTopIndices[pos][l].Length;
                         Array.Clear(dxNormFfn, 0, embDim);
 
-                        Span<float> dTopWeights = dTopWeightsBuffer.Slice(0, kUsed);
-                        dTopWeights.Clear();
-
-                        for (int ki = 0; ki < kUsed; ki++)
+                        // 1. Shared Experts Backprop (DeepSeek MoE architecture)
+                        if (layer.SharedExperts != null && layer.SharedExperts.Length > 0 && lParams.SharedExpertWdown != null)
                         {
-                            int expIdx = moeTopIndices[pos][l][ki];
-                            float w = moeTopWeights[pos][l][ki];
-                            var exp = layer.Experts[expIdx];
-                            var expParamsWdown = lParams.ExpertWdown![expIdx];
-                            var expParamsWgate = lParams.ExpertWgate![expIdx];
-                            var expParamsWup = lParams.ExpertWup![expIdx];
-
-                            // 1. dw: derivative wrt routing weight w_k
-                            float dw = 0f;
-                            for (int d = 0; d < embDim; d++)
+                            int seCount = layer.SharedExperts.Length;
+                            for (int se = 0; se < seCount; se++)
                             {
-                                dw += dx[d] * moeDown[pos][l][ki][d];
-                            }
-                            dTopWeights[ki] = dw;
+                                var sExp = layer.SharedExperts[se];
+                                var seWdown = lParams.SharedExpertWdown[se];
+                                var seWgate = lParams.SharedExpertWgate![se];
+                                var seWup = lParams.SharedExpertWup![se];
 
-                            // 2. Expert Wdown backprop
-                            Array.Clear(dSwiglu, 0, ffnDim);
-                            for (int o = 0; o < embDim; o++)
-                            {
-                                float dX_o = dx[o] * w;
-                                if (dX_o == 0f) continue;
-                                int rowOff = o * ffnDim;
+                                Array.Clear(dSwiglu, 0, ffnDim);
+                                for (int o = 0; o < embDim; o++)
+                                {
+                                    float dX_o = dx[o]; // Shared expert weight is 1.0
+                                    if (dX_o == 0f) continue;
+                                    int rowOff = o * ffnDim;
+                                    for (int i = 0; i < ffnDim; i++)
+                                    {
+                                        seWdown.Grads[rowOff + i] += dX_o * moeSharedSwiglu[pos][l][se][i];
+                                        dSwiglu[i] += dX_o * sExp.Wdown[rowOff + i];
+                                    }
+                                }
+
                                 for (int i = 0; i < ffnDim; i++)
                                 {
-                                    expParamsWdown.Grads[rowOff + i] += dX_o * moeSwiglu[pos][l][ki][i];
-                                    dSwiglu[i] += dX_o * exp.Wdown[rowOff + i];
+                                    float gVal = moeSharedGate[pos][l][se][i];
+                                    float uVal = moeSharedUp[pos][l][se][i];
+                                    float sig = 1.0f / (1.0f + (float)Math.Exp(-gVal));
+                                    float swish = gVal * sig;
+                                    float dSwish = sig * (1.0f + gVal * (1.0f - sig));
+                                    dUp[i] = dSwiglu[i] * swish;
+                                    dGate[i] = dSwiglu[i] * uVal * dSwish;
                                 }
-                            }
 
-                            // 3. SwiGLU backward
-                            for (int i = 0; i < ffnDim; i++)
-                            {
-                                float gVal = moeGate[pos][l][ki][i];
-                                float uVal = moeUp[pos][l][ki][i];
-                                float sig = 1.0f / (1.0f + (float)Math.Exp(-gVal));
-                                float swish = gVal * sig;
-                                float dSwish = sig * (1.0f + gVal * (1.0f - sig));
-                                dUp[i] = dSwiglu[i] * swish;
-                                dGate[i] = dSwiglu[i] * uVal * dSwish;
-                            }
-
-                            // 4. Expert Wgate & Wup backprop
-                            for (int kIdx = 0; kIdx < ffnDim; kIdx++)
-                            {
-                                float dg = dGate[kIdx];
-                                float du = dUp[kIdx];
-                                int rowOff = kIdx * embDim;
-                                for (int j = 0; j < embDim; j++)
+                                for (int kIdx = 0; kIdx < ffnDim; kIdx++)
                                 {
-                                    expParamsWgate.Grads[rowOff + j] += dg * xNormFfn[pos][l][j];
-                                    expParamsWup.Grads[rowOff + j] += du * xNormFfn[pos][l][j];
-                                    dxNormFfn[j] += dg * exp.Wgate[rowOff + j] + du * exp.Wup[rowOff + j];
+                                    float dg = dGate[kIdx];
+                                    float du = dUp[kIdx];
+                                    int rowOff = kIdx * embDim;
+                                    for (int j = 0; j < embDim; j++)
+                                    {
+                                        seWgate.Grads[rowOff + j] += dg * xNormFfn[pos][l][j];
+                                        seWup.Grads[rowOff + j] += du * xNormFfn[pos][l][j];
+                                        dxNormFfn[j] += dg * sExp.Wgate[rowOff + j] + du * sExp.Wup[rowOff + j];
+                                    }
                                 }
                             }
                         }
 
-                        // 5. Router Gating Backprop (Softmax derivative over Top-K)
-                        float dotVal = 0f;
-                        for (int ki = 0; ki < kUsed; ki++)
+                        // 2. Routed Experts Backprop
+                        if (layer.Experts != null && layer.Experts.Length > 0 && moeTopIndices[pos][l] != null)
                         {
-                            dotVal += moeTopWeights[pos][l][ki] * dTopWeights[ki];
-                        }
+                            int expCount = layer.Experts.Length;
+                            int kUsed = moeTopIndices[pos][l].Length;
 
-                        if (lParams.Wrouter != null)
-                        {
+                            Span<float> dTopWeights = dTopWeightsBuffer.Slice(0, kUsed);
+                            dTopWeights.Clear();
+
                             for (int ki = 0; ki < kUsed; ki++)
                             {
                                 int expIdx = moeTopIndices[pos][l][ki];
-                                float p = moeTopWeights[pos][l][ki];
-                                float dLogit = p * (dTopWeights[ki] - dotVal);
+                                float w = moeTopWeights[pos][l][ki];
+                                var exp = layer.Experts[expIdx];
+                                var expParamsWdown = lParams.ExpertWdown![expIdx];
+                                var expParamsWgate = lParams.ExpertWgate![expIdx];
+                                var expParamsWup = lParams.ExpertWup![expIdx];
 
-                                int rOff = expIdx * embDim;
-                                for (int j = 0; j < embDim; j++)
+                                // 1. dw: derivative wrt routing weight w_k
+                                float dw = 0f;
+                                for (int d = 0; d < embDim; d++)
                                 {
-                                    lParams.Wrouter.Grads[rOff + j] += dLogit * xNormFfn[pos][l][j];
-                                    dxNormFfn[j] += dLogit * layer.Wrouter![rOff + j];
+                                    dw += dx[d] * moeDown[pos][l][ki][d];
+                                }
+                                dTopWeights[ki] = dw;
+
+                                // 2. Expert Wdown backprop
+                                Array.Clear(dSwiglu, 0, ffnDim);
+                                for (int o = 0; o < embDim; o++)
+                                {
+                                    float dX_o = dx[o] * w;
+                                    if (dX_o == 0f) continue;
+                                    int rowOff = o * ffnDim;
+                                    for (int i = 0; i < ffnDim; i++)
+                                    {
+                                        expParamsWdown.Grads[rowOff + i] += dX_o * moeSwiglu[pos][l][ki][i];
+                                        dSwiglu[i] += dX_o * exp.Wdown[rowOff + i];
+                                    }
+                                }
+
+                                // 3. SwiGLU backward
+                                for (int i = 0; i < ffnDim; i++)
+                                {
+                                    float gVal = moeGate[pos][l][ki][i];
+                                    float uVal = moeUp[pos][l][ki][i];
+                                    float sig = 1.0f / (1.0f + (float)Math.Exp(-gVal));
+                                    float swish = gVal * sig;
+                                    float dSwish = sig * (1.0f + gVal * (1.0f - sig));
+                                    dUp[i] = dSwiglu[i] * swish;
+                                    dGate[i] = dSwiglu[i] * uVal * dSwish;
+                                }
+
+                                // 4. Expert Wgate & Wup backprop
+                                for (int kIdx = 0; kIdx < ffnDim; kIdx++)
+                                {
+                                    float dg = dGate[kIdx];
+                                    float du = dUp[kIdx];
+                                    int rowOff = kIdx * embDim;
+                                    for (int j = 0; j < embDim; j++)
+                                    {
+                                        expParamsWgate.Grads[rowOff + j] += dg * xNormFfn[pos][l][j];
+                                        expParamsWup.Grads[rowOff + j] += du * xNormFfn[pos][l][j];
+                                        dxNormFfn[j] += dg * exp.Wgate[rowOff + j] + du * exp.Wup[rowOff + j];
+                                    }
+                                }
+                            }
+
+                            // 5. Router Gating Backprop (Softmax derivative over Top-K)
+                            float dotVal = 0f;
+                            for (int ki = 0; ki < kUsed; ki++)
+                            {
+                                dotVal += moeTopWeights[pos][l][ki] * dTopWeights[ki];
+                            }
+
+                            if (lParams.Wrouter != null)
+                            {
+                                for (int ki = 0; ki < kUsed; ki++)
+                                {
+                                    int expIdx = moeTopIndices[pos][l][ki];
+                                    float p = moeTopWeights[pos][l][ki];
+                                    float dLogit = p * (dTopWeights[ki] - dotVal);
+
+                                    int rOff = expIdx * embDim;
+                                    for (int j = 0; j < embDim; j++)
+                                    {
+                                        lParams.Wrouter.Grads[rOff + j] += dLogit * xNormFfn[pos][l][j];
+                                        dxNormFfn[j] += dLogit * layer.Wrouter![rOff + j];
+                                    }
                                 }
                             }
                         }

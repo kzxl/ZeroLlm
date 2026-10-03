@@ -26,38 +26,68 @@ namespace ZeroLlm.Core.Layers
         /// <param name="upScratch">Scratch buffer for SwiGLU up [ffnDim].</param>
         /// <param name="swigluScratch">Scratch buffer for SwiGLU activation [ffnDim].</param>
         /// <param name="residualOutput">Output accumulator where weighted expert outputs are added (x).</param>
+        /// <param name="sharedExperts">Optional always-active shared experts (DeepSeek / Qwen-MoE architecture).</param>
         public static void Forward(
             ReadOnlySpan<float> xNorm,
             ReadOnlySpan<float> wrouter,
             BlockQ8_0[]? wrouter_q8,
             BlockQ4_0[]? wrouter_q4,
-            LlmExpertWeights[] experts,
+            LlmExpertWeights[]? experts,
             int expertUsedCount,
             int embDim,
             int ffnDim,
             Span<float> gateScratch,
             Span<float> upScratch,
             Span<float> swigluScratch,
-            Span<float> residualOutput)
+            Span<float> residualOutput,
+            LlmExpertWeights[]? sharedExperts = null)
         {
+            // 1. Process Shared Experts (Always active, DeepSeek / Qwen style)
+            if (sharedExperts != null && sharedExperts.Length > 0)
+            {
+                Span<float> sharedDownOut = stackalloc float[embDim];
+                for (int s = 0; s < sharedExperts.Length; s++)
+                {
+                    var sexp = sharedExperts[s];
+                    if (sexp.Wgate_Q8 != null) QuantizedKernels.MatVecMulQ8_0(sexp.Wgate_Q8, xNorm, gateScratch, ffnDim, embDim);
+                    else if (sexp.Wgate_Q4 != null) QuantizedKernels.MatVecMulQ4_0(sexp.Wgate_Q4, xNorm, gateScratch, ffnDim, embDim);
+                    else MatVec(xNorm, sexp.Wgate, embDim, ffnDim, gateScratch);
+
+                    if (sexp.Wup_Q8 != null) QuantizedKernels.MatVecMulQ8_0(sexp.Wup_Q8, xNorm, upScratch, ffnDim, embDim);
+                    else if (sexp.Wup_Q4 != null) QuantizedKernels.MatVecMulQ4_0(sexp.Wup_Q4, xNorm, upScratch, ffnDim, embDim);
+                    else MatVec(xNorm, sexp.Wup, embDim, ffnDim, upScratch);
+
+                    SwiGLU.Forward(gateScratch, upScratch, swigluScratch);
+
+                    if (sexp.Wdown_Q8 != null) QuantizedKernels.MatVecMulQ8_0(sexp.Wdown_Q8, swigluScratch, sharedDownOut, embDim, ffnDim);
+                    else if (sexp.Wdown_Q4 != null) QuantizedKernels.MatVecMulQ4_0(sexp.Wdown_Q4, swigluScratch, sharedDownOut, embDim, ffnDim);
+                    else MatVec(swigluScratch, sexp.Wdown, ffnDim, embDim, sharedDownOut);
+
+                    for (int d = 0; d < embDim; d++)
+                    {
+                        residualOutput[d] += sharedDownOut[d];
+                    }
+                }
+            }
+
             if (experts == null || experts.Length == 0) return;
 
             int expertCount = experts.Length;
             int topK = Math.Min(Math.Max(1, expertUsedCount), expertCount);
 
-            // 1. Calculate router logits: [expertCount]
+            // 2. Calculate router logits: [expertCount]
             Span<float> routerLogits = stackalloc float[expertCount];
             ComputeRouterLogits(xNorm, wrouter, wrouter_q8, wrouter_q4, routerLogits, expertCount, embDim);
 
-            // 2. Select Top-K experts
+            // 3. Select Top-K experts
             Span<int> topIndices = stackalloc int[topK];
             Span<float> topWeights = stackalloc float[topK];
             SelectTopK(routerLogits, topIndices, topWeights, topK);
 
-            // 3. Compute Softmax normalization over selected Top-K logits
+            // 4. Compute Softmax normalization over selected Top-K logits
             ComputeSoftmax(topWeights);
 
-            // 4. Dispatch to selected experts and accumulate weighted outputs
+            // 5. Dispatch to selected experts and accumulate weighted outputs
             Span<float> expertDownOut = stackalloc float[embDim];
 
             for (int k = 0; k < topK; k++)

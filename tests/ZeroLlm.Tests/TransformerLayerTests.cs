@@ -194,5 +194,54 @@ namespace ZeroLlm.Tests
             float updatedRouterWeight = model.Layers[0].Wrouter![0];
             Assert.NotEqual(initialRouterWeight, updatedRouterWeight);
         }
+
+        [Fact]
+        public void LlmTrainer_SharedExpertMoE_TrainingStep_Should_UpdateSharedAndRoutedWeights_And_NotProduceNaN()
+        {
+            var config = LlmModelConfig.CreateMicroMoE(
+                vocabSize: 64,
+                contextLength: 32,
+                embeddingDim: 16,
+                layerCount: 2,
+                headCount: 2,
+                headCountKv: 2,
+                feedForwardDim: 32,
+                expertCount: 4,
+                expertUsedCount: 2,
+                sharedExpertCount: 1);
+
+            var model = LlmModel.CreateSynthetic(config, seed: 456);
+            Assert.NotNull(model.Layers[0].SharedExperts);
+            Assert.Single(model.Layers[0].SharedExperts!);
+
+            var trainer = new ZeroLlm.Core.Training.LlmTrainer(model, new ZeroLlm.Core.Training.TrainingConfig
+            {
+                LearningRate = 1e-2f,
+                AuxiliaryLossWeight = 0.05f,
+                Mode = ZeroLlm.Core.Training.TrainingMode.Full
+            });
+
+            float initialSharedWdown = model.Layers[0].SharedExperts![0].Wdown[0];
+            float initialRoutedWdown = model.Layers[0].Experts![0].Wdown[0];
+
+            int[] tokens = new int[] { 1, 12, 18, 22, 28, 35, 2 };
+            var result1 = trainer.TrainStep(tokens, targetStartPos: 2);
+
+            Assert.False(float.IsNaN(result1.Loss));
+            Assert.True(result1.Loss > 0f);
+
+            // Step a few times to verify convergence and gradient updates
+            for (int i = 0; i < 5; i++)
+            {
+                var step = trainer.TrainStep(tokens, targetStartPos: 2);
+                Assert.False(float.IsNaN(step.Loss));
+            }
+
+            float updatedSharedWdown = model.Layers[0].SharedExperts![0].Wdown[0];
+            float updatedRoutedWdown = model.Layers[0].Experts![0].Wdown[0];
+
+            Assert.NotEqual(initialSharedWdown, updatedSharedWdown);
+            Assert.NotEqual(initialRoutedWdown, updatedRoutedWdown);
+        }
     }
 }

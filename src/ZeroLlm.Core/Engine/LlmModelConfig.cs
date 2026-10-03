@@ -30,9 +30,15 @@ namespace ZeroLlm.Core.Engine
         public int ExpertUsedCount { get; set; } = 0;
 
         /// <summary>
+        /// Number of always-active shared experts per layer (DeepSeek / Qwen-MoE architecture).
+        /// Shared experts preserve foundational linguistic and domain reasoning across all tokens.
+        /// </summary>
+        public int SharedExpertCount { get; set; } = 0;
+
+        /// <summary>
         /// Indicates whether this configuration defines a Sparse Mixture-of-Experts architecture.
         /// </summary>
-        public bool IsMoE => ExpertCount > 1;
+        public bool IsMoE => ExpertCount > 1 || SharedExpertCount > 0;
 
         /// <summary>
         /// Creates a canonical configuration for a generic Micro-SLM (~11.5M parameters).
@@ -76,7 +82,8 @@ namespace ZeroLlm.Core.Engine
             int headCountKv = 2,
             int feedForwardDim = 512,
             int expertCount = 4,
-            int expertUsedCount = 2)
+            int expertUsedCount = 2,
+            int sharedExpertCount = 1)
         {
             return new LlmModelConfig
             {
@@ -93,7 +100,8 @@ namespace ZeroLlm.Core.Engine
                 BosTokenId = 1,
                 EosTokenId = 2,
                 ExpertCount = expertCount,
-                ExpertUsedCount = expertUsedCount
+                ExpertUsedCount = expertUsedCount,
+                SharedExpertCount = sharedExpertCount
             };
         }
 
@@ -116,7 +124,8 @@ namespace ZeroLlm.Core.Engine
             int headCountKv = 4,
             int feedForwardDim = 1024,
             int expertCount = 4,
-            int expertUsedCount = 2)
+            int expertUsedCount = 2,
+            int sharedExpertCount = 1)
         {
             return new LlmModelConfig
             {
@@ -133,7 +142,8 @@ namespace ZeroLlm.Core.Engine
                 BosTokenId = 1,
                 EosTokenId = 2,
                 ExpertCount = expertCount,
-                ExpertUsedCount = expertUsedCount
+                ExpertUsedCount = expertUsedCount,
+                SharedExpertCount = sharedExpertCount
             };
         }
     }

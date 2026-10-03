@@ -230,9 +230,9 @@ namespace ZeroLlm.Core.Engine
                 // FFN RMSNorm
                 RmsNorm.Forward(x, layer.FfnNorm, xNorm, cfg.RmsNormEps);
 
-                if (layer.IsMoE && layer.Experts != null && layer.Experts.Length > 0)
+                if (layer.IsMoE)
                 {
-                    // Sparse Mixture-of-Experts (MoE) FFN with Top-K Gating
+                    // Sparse Mixture-of-Experts (MoE) FFN with Top-K Gating and Shared Experts (DeepSeek style)
                     SparseMoeLayer.Forward(
                         xNorm,
                         layer.Wrouter,
@@ -245,7 +245,8 @@ namespace ZeroLlm.Core.Engine
                         gate,
                         up,
                         swiglu,
-                        x);
+                        x,
+                        layer.SharedExperts);
                 }
                 else
                 {
