@@ -9,6 +9,11 @@ namespace ZeroLlm.Core.Sampling
     public delegate void LogitProcessor(Span<float> logits);
 
     /// <summary>
+    /// Delegate for applying context-aware in-place logit modifications with access to past tokens.
+    /// </summary>
+    public delegate void ContextAwareLogitProcessor(Span<float> logits, ReadOnlySpan<int> pastTokens);
+
+    /// <summary>
     /// Pure C# token sampling engine supporting Greedy, Temperature scaling, Top-K, Top-P, Min-P, and Repetition Penalty.
     /// </summary>
     public static class LlmSampler
@@ -18,12 +23,17 @@ namespace ZeroLlm.Core.Sampling
             ReadOnlySpan<int> pastTokens,
             SamplingConfig config,
             Random? random = null,
-            LogitProcessor? logitProcessor = null)
+            LogitProcessor? logitProcessor = null,
+            ContextAwareLogitProcessor? contextLogitProcessor = null)
         {
             if (logits.Length == 0) throw new ArgumentException("Logits span cannot be empty.", nameof(logits));
 
-            // 0. Apply custom Logit Processor (e.g. ZeroPrompt GrammarLogitMasker for PDA JSON/Schema decoding)
-            logitProcessor?.Invoke(logits);
+            // 0. Apply custom Logit Processors
+            var proc = logitProcessor ?? config.LogitProcessor;
+            proc?.Invoke(logits);
+
+            var ctxProc = contextLogitProcessor ?? config.ContextLogitProcessor;
+            ctxProc?.Invoke(logits, pastTokens);
 
             // 1. Apply Repetition Penalty
             if (config.RepetitionPenalty > 1.0f && pastTokens.Length > 0)

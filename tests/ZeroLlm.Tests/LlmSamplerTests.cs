@@ -59,5 +59,63 @@ namespace ZeroLlm.Tests
             int selected = LlmSampler.Sample(logits, ReadOnlySpan<int>.Empty, config, new Random(42));
             Assert.Equal(0, selected);
         }
+
+        [Fact]
+        public void ThinkingConstraintLogitProcessor_Should_Enforce_Thinking_Transitions()
+        {
+            int thoughtToken = 100;
+            int endThoughtToken = 101;
+            int responseToken = 102;
+            int endResponseToken = 103;
+            int toolCallToken = 104;
+            int endToolCallToken = 105;
+            int eosToken = 2;
+
+            var guard = new ThinkingConstraintLogitProcessor(
+                thoughtTokenId: thoughtToken,
+                endThoughtTokenId: endThoughtToken,
+                responseTokenId: responseToken,
+                endResponseTokenId: endResponseToken,
+                toolCallTokenId: toolCallToken,
+                endToolCallTokenId: endToolCallToken,
+                minThinkingTokens: 2,
+                maxThinkingTokens: 5,
+                eosTokenId: eosToken);
+
+            int vocabSize = 200;
+            float[] logits = new float[vocabSize];
+            Array.Fill(logits, 1.0f);
+
+            var past = new System.Collections.Generic.List<int> { 10, 20 }; // Prompt tokens
+
+            // Step 1: Very first token MUST be forced to <thought>
+            guard.Process(logits, past.ToArray());
+            int step1Tok = LlmSampler.Sample(logits, past.ToArray(), SamplingConfig.Greedy);
+            Assert.Equal(thoughtToken, step1Tok);
+            past.Add(step1Tok);
+
+            // Step 2: Inside thought, under min budget (1 < 2) -> </thought> is banned
+            Array.Fill(logits, 1.0f);
+            logits[endThoughtToken] = 100.0f; // Model attempts to close early
+            guard.Process(logits, past.ToArray());
+            int step2Tok = LlmSampler.Sample(logits, past.ToArray(), SamplingConfig.Greedy);
+            Assert.NotEqual(endThoughtToken, step2Tok); // Early closure prevented!
+            past.Add(50); // Regular thinking token
+
+            // Step 3: Inside thought, over max budget -> </thought> is forced
+            for (int i = 0; i < 5; i++) past.Add(60 + i);
+            Array.Fill(logits, 1.0f);
+            guard.Process(logits, past.ToArray());
+            int stepOverTok = LlmSampler.Sample(logits, past.ToArray(), SamplingConfig.Greedy);
+            Assert.Equal(endThoughtToken, stepOverTok);
+            past.Add(stepOverTok);
+
+            // Step 4: Immediately after </thought>, MUST emit <response> or <tool_call>
+            Array.Fill(logits, 1.0f);
+            logits[50] = 50.0f; // Model tries to output random text
+            guard.Process(logits, past.ToArray());
+            int transitionTok = LlmSampler.Sample(logits, past.ToArray(), SamplingConfig.Greedy);
+            Assert.Equal(responseToken, transitionTok); // Transition enforced!
+        }
     }
 }

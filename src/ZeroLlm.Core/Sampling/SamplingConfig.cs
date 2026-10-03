@@ -14,6 +14,8 @@ namespace ZeroLlm.Core.Sampling
         public float RepetitionPenalty { get; set; } = 1.1f;
         public int MaxTokens { get; set; } = 256;
         public HashSet<int> StopTokens { get; set; } = new HashSet<int>();
+        public LogitProcessor? LogitProcessor { get; set; }
+        public ContextAwareLogitProcessor? ContextLogitProcessor { get; set; }
 
         public static SamplingConfig Greedy => new SamplingConfig
         {
