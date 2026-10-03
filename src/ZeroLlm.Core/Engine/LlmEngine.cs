@@ -1,5 +1,7 @@
 using System;
 using System.Collections.Generic;
+using System.Numerics;
+using System.Runtime.CompilerServices;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
@@ -277,31 +279,100 @@ namespace ZeroLlm.Core.Engine
             else MatVec(xNorm, _model.LmHead, embDim, cfg.VocabSize, logits);
         }
 
-        private static void MatVec(ReadOnlySpan<float> input, ReadOnlySpan<float> weight, int inDim, int outDim, Span<float> output)
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal static unsafe float DotProductSimd(float* pA, float* pB, int len)
         {
-            for (int o = 0; o < outDim; o++)
+            int vecSize = Vector<float>.Count;
+            int step4 = vecSize * 4;
+            int limit4 = len - (len % step4);
+            int limit1 = len - (len % vecSize);
+
+            Vector<float> acc0 = Vector<float>.Zero;
+            Vector<float> acc1 = Vector<float>.Zero;
+            Vector<float> acc2 = Vector<float>.Zero;
+            Vector<float> acc3 = Vector<float>.Zero;
+
+            int i = 0;
+            for (; i < limit4; i += step4)
             {
-                float dot = 0.0f;
-                int rowOffset = o * inDim;
-                for (int i = 0; i < inDim; i++)
+                acc0 += *(Vector<float>*)(pA + i) * *(Vector<float>*)(pB + i);
+                acc1 += *(Vector<float>*)(pA + i + vecSize) * *(Vector<float>*)(pB + i + vecSize);
+                acc2 += *(Vector<float>*)(pA + i + (vecSize * 2)) * *(Vector<float>*)(pB + i + (vecSize * 2));
+                acc3 += *(Vector<float>*)(pA + i + (vecSize * 3)) * *(Vector<float>*)(pB + i + (vecSize * 3));
+            }
+
+            acc0 = (acc0 + acc1) + (acc2 + acc3);
+
+            for (; i < limit1; i += vecSize)
+            {
+                acc0 += *(Vector<float>*)(pA + i) * *(Vector<float>*)(pB + i);
+            }
+
+            float sum = Vector.Dot(acc0, Vector<float>.One);
+
+            for (; i < len; i++)
+            {
+                sum += pA[i] * pB[i];
+            }
+
+            return sum;
+        }
+
+        internal static unsafe void MatVec(ReadOnlySpan<float> input, ReadOnlySpan<float> weight, int inDim, int outDim, Span<float> output)
+        {
+            fixed (float* pIn = input)
+            fixed (float* pW = weight)
+            fixed (float* pOut = output)
+            {
+                if (outDim >= 1024)
                 {
-                    dot += input[i] * weight[rowOffset + i];
+                    IntPtr ptrIn = (IntPtr)pIn;
+                    IntPtr ptrW = (IntPtr)pW;
+                    IntPtr ptrOut = (IntPtr)pOut;
+                    Parallel.For(0, outDim, o =>
+                    {
+                        float* inPtr = (float*)ptrIn;
+                        float* wPtr = (float*)ptrW;
+                        float* outPtr = (float*)ptrOut;
+                        outPtr[o] = DotProductSimd(inPtr, wPtr + (o * inDim), inDim);
+                    });
                 }
-                output[o] = dot;
+                else
+                {
+                    for (int o = 0; o < outDim; o++)
+                    {
+                        pOut[o] = DotProductSimd(pIn, pW + (o * inDim), inDim);
+                    }
+                }
             }
         }
 
-        private static void MatVecAdd(ReadOnlySpan<float> input, ReadOnlySpan<float> weight, int inDim, int outDim, Span<float> accOutput)
+        internal static unsafe void MatVecAdd(ReadOnlySpan<float> input, ReadOnlySpan<float> weight, int inDim, int outDim, Span<float> accOutput)
         {
-            for (int o = 0; o < outDim; o++)
+            fixed (float* pIn = input)
+            fixed (float* pW = weight)
+            fixed (float* pOut = accOutput)
             {
-                float dot = 0.0f;
-                int rowOffset = o * inDim;
-                for (int i = 0; i < inDim; i++)
+                if (outDim >= 1024)
                 {
-                    dot += input[i] * weight[rowOffset + i];
+                    IntPtr ptrIn = (IntPtr)pIn;
+                    IntPtr ptrW = (IntPtr)pW;
+                    IntPtr ptrOut = (IntPtr)pOut;
+                    Parallel.For(0, outDim, o =>
+                    {
+                        float* inPtr = (float*)ptrIn;
+                        float* wPtr = (float*)ptrW;
+                        float* outPtr = (float*)ptrOut;
+                        outPtr[o] += DotProductSimd(inPtr, wPtr + (o * inDim), inDim);
+                    });
                 }
-                accOutput[o] += dot;
+                else
+                {
+                    for (int o = 0; o < outDim; o++)
+                    {
+                        pOut[o] += DotProductSimd(pIn, pW + (o * inDim), inDim);
+                    }
+                }
             }
         }
 

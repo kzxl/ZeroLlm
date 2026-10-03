@@ -1,4 +1,6 @@
 using System;
+using System.Numerics;
+using System.Runtime.CompilerServices;
 using ZeroLlm.Core.Engine;
 using ZeroLlm.Core.Quantization;
 
@@ -9,7 +11,7 @@ namespace ZeroLlm.Core.Layers
     /// Implements Top-K Gating Router with Softmax dispatch across N independent Feed-Forward Experts.
     /// Supports FP32, Q8_0, and Q4_0 quantized weight representations with zero GC overhead during inference.
     /// </summary>
-    public static class SparseMoeLayer
+    public static unsafe class SparseMoeLayer
     {
         /// <summary>
         /// Executes a single forward token pass through the Sparse MoE layer.
@@ -63,10 +65,7 @@ namespace ZeroLlm.Core.Layers
                     else if (sexp.Wdown_Q4 != null) QuantizedKernels.MatVecMulQ4_0(sexp.Wdown_Q4, swigluScratch, sharedDownOut, embDim, ffnDim);
                     else MatVec(swigluScratch, sexp.Wdown, ffnDim, embDim, sharedDownOut);
 
-                    for (int d = 0; d < embDim; d++)
-                    {
-                        residualOutput[d] += sharedDownOut[d];
-                    }
+                    AddResidual(residualOutput, sharedDownOut, embDim);
                 }
             }
 
@@ -121,10 +120,7 @@ namespace ZeroLlm.Core.Layers
                 else MatVec(swigluScratch, exp.Wdown, ffnDim, embDim, expertDownOut);
 
                 // Weighted residual addition: residualOutput += weight * expertDownOut
-                for (int d = 0; d < embDim; d++)
-                {
-                    residualOutput[d] += weight * expertDownOut[d];
-                }
+                AddWeightedResidual(residualOutput, expertDownOut, weight, embDim);
             }
         }
 
@@ -222,17 +218,48 @@ namespace ZeroLlm.Core.Layers
             }
         }
 
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private static void MatVec(ReadOnlySpan<float> input, ReadOnlySpan<float> weight, int inDim, int outDim, Span<float> output)
         {
-            for (int r = 0; r < outDim; r++)
+            LlmEngine.MatVec(input, weight, inDim, outDim, output);
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static void AddResidual(Span<float> dest, ReadOnlySpan<float> src, int len)
+        {
+            int vecSize = Vector<float>.Count;
+            int simdLimit = len - (len % vecSize);
+            fixed (float* pDest = dest)
+            fixed (float* pSrc = src)
             {
-                int rowOffset = r * inDim;
-                float sum = 0.0f;
-                for (int c = 0; c < inDim; c++)
+                for (int i = 0; i < simdLimit; i += vecSize)
                 {
-                    sum += input[c] * weight[rowOffset + c];
+                    *(Vector<float>*)(pDest + i) += *(Vector<float>*)(pSrc + i);
                 }
-                output[r] = sum;
+                for (int i = simdLimit; i < len; i++)
+                {
+                    pDest[i] += pSrc[i];
+                }
+            }
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static void AddWeightedResidual(Span<float> dest, ReadOnlySpan<float> src, float weight, int len)
+        {
+            int vecSize = Vector<float>.Count;
+            int simdLimit = len - (len % vecSize);
+            var vWeight = new Vector<float>(weight);
+            fixed (float* pDest = dest)
+            fixed (float* pSrc = src)
+            {
+                for (int i = 0; i < simdLimit; i += vecSize)
+                {
+                    *(Vector<float>*)(pDest + i) += vWeight * *(Vector<float>*)(pSrc + i);
+                }
+                for (int i = simdLimit; i < len; i++)
+                {
+                    pDest[i] += weight * pSrc[i];
+                }
             }
         }
     }

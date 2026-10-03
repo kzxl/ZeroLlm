@@ -172,7 +172,7 @@ namespace ZeroLlm.Core.Quantization
                 for (int l = 0; l < model.Config.LayerCount; l++)
                 {
                     var src = model.Layers[l];
-                    qModel.Layers[l] = new LlmLayerWeights
+                    var qLayer = new LlmLayerWeights
                     {
                         AttnNorm = (float[])src.AttnNorm.Clone(),
                         FfnNorm = (float[])src.FfnNorm.Clone(),
@@ -180,10 +180,55 @@ namespace ZeroLlm.Core.Quantization
                         Wk_Q8 = QuantizeToQ8_0(src.Wk),
                         Wv_Q8 = QuantizeToQ8_0(src.Wv),
                         Wo_Q8 = QuantizeToQ8_0(src.Wo),
-                        Wgate_Q8 = QuantizeToQ8_0(src.Wgate),
-                        Wup_Q8 = QuantizeToQ8_0(src.Wup),
-                        Wdown_Q8 = QuantizeToQ8_0(src.Wdown)
                     };
+
+                    if (src.IsMoE)
+                    {
+                        if (src.Wrouter != null && src.Wrouter.Length > 0)
+                        {
+                            qLayer.Wrouter_Q8 = QuantizeToQ8_0(src.Wrouter);
+                        }
+
+                        if (src.Experts != null && src.Experts.Length > 0)
+                        {
+                            qLayer.Experts = new LlmExpertWeights[src.Experts.Length];
+                            for (int e = 0; e < src.Experts.Length; e++)
+                            {
+                                var expSrc = src.Experts[e];
+                                qLayer.Experts[e] = new LlmExpertWeights
+                                {
+                                    ExpertId = expSrc.ExpertId,
+                                    Wgate_Q8 = QuantizeToQ8_0(expSrc.Wgate),
+                                    Wup_Q8 = QuantizeToQ8_0(expSrc.Wup),
+                                    Wdown_Q8 = QuantizeToQ8_0(expSrc.Wdown)
+                                };
+                            }
+                        }
+
+                        if (src.SharedExperts != null && src.SharedExperts.Length > 0)
+                        {
+                            qLayer.SharedExperts = new LlmExpertWeights[src.SharedExperts.Length];
+                            for (int se = 0; se < src.SharedExperts.Length; se++)
+                            {
+                                var sExpSrc = src.SharedExperts[se];
+                                qLayer.SharedExperts[se] = new LlmExpertWeights
+                                {
+                                    ExpertId = sExpSrc.ExpertId,
+                                    Wgate_Q8 = QuantizeToQ8_0(sExpSrc.Wgate),
+                                    Wup_Q8 = QuantizeToQ8_0(sExpSrc.Wup),
+                                    Wdown_Q8 = QuantizeToQ8_0(sExpSrc.Wdown)
+                                };
+                            }
+                        }
+                    }
+                    else
+                    {
+                        if (src.Wgate != null && src.Wgate.Length > 0) qLayer.Wgate_Q8 = QuantizeToQ8_0(src.Wgate);
+                        if (src.Wup != null && src.Wup.Length > 0) qLayer.Wup_Q8 = QuantizeToQ8_0(src.Wup);
+                        if (src.Wdown != null && src.Wdown.Length > 0) qLayer.Wdown_Q8 = QuantizeToQ8_0(src.Wdown);
+                    }
+
+                    qModel.Layers[l] = qLayer;
                 }
 
                 if (model.LmHead != null && model.LmHead.Length > 0 && model.LmHead != model.TokenEmbeddings)
@@ -201,7 +246,7 @@ namespace ZeroLlm.Core.Quantization
                 for (int l = 0; l < model.Config.LayerCount; l++)
                 {
                     var src = model.Layers[l];
-                    qModel.Layers[l] = new LlmLayerWeights
+                    var qLayer = new LlmLayerWeights
                     {
                         AttnNorm = (float[])src.AttnNorm.Clone(),
                         FfnNorm = (float[])src.FfnNorm.Clone(),
@@ -209,10 +254,55 @@ namespace ZeroLlm.Core.Quantization
                         Wk_Q4 = QuantizeToQ4_0(src.Wk),
                         Wv_Q4 = QuantizeToQ4_0(src.Wv),
                         Wo_Q4 = QuantizeToQ4_0(src.Wo),
-                        Wgate_Q4 = QuantizeToQ4_0(src.Wgate),
-                        Wup_Q4 = QuantizeToQ4_0(src.Wup),
-                        Wdown_Q4 = QuantizeToQ4_0(src.Wdown)
                     };
+
+                    if (src.IsMoE)
+                    {
+                        if (src.Wrouter != null && src.Wrouter.Length > 0)
+                        {
+                            qLayer.Wrouter_Q4 = QuantizeToQ4_0(src.Wrouter);
+                        }
+
+                        if (src.Experts != null && src.Experts.Length > 0)
+                        {
+                            qLayer.Experts = new LlmExpertWeights[src.Experts.Length];
+                            for (int e = 0; e < src.Experts.Length; e++)
+                            {
+                                var expSrc = src.Experts[e];
+                                qLayer.Experts[e] = new LlmExpertWeights
+                                {
+                                    ExpertId = expSrc.ExpertId,
+                                    Wgate_Q4 = QuantizeToQ4_0(expSrc.Wgate),
+                                    Wup_Q4 = QuantizeToQ4_0(expSrc.Wup),
+                                    Wdown_Q4 = QuantizeToQ4_0(expSrc.Wdown)
+                                };
+                            }
+                        }
+
+                        if (src.SharedExperts != null && src.SharedExperts.Length > 0)
+                        {
+                            qLayer.SharedExperts = new LlmExpertWeights[src.SharedExperts.Length];
+                            for (int se = 0; se < src.SharedExperts.Length; se++)
+                            {
+                                var sExpSrc = src.SharedExperts[se];
+                                qLayer.SharedExperts[se] = new LlmExpertWeights
+                                {
+                                    ExpertId = sExpSrc.ExpertId,
+                                    Wgate_Q4 = QuantizeToQ4_0(sExpSrc.Wgate),
+                                    Wup_Q4 = QuantizeToQ4_0(sExpSrc.Wup),
+                                    Wdown_Q4 = QuantizeToQ4_0(sExpSrc.Wdown)
+                                };
+                            }
+                        }
+                    }
+                    else
+                    {
+                        if (src.Wgate != null && src.Wgate.Length > 0) qLayer.Wgate_Q4 = QuantizeToQ4_0(src.Wgate);
+                        if (src.Wup != null && src.Wup.Length > 0) qLayer.Wup_Q4 = QuantizeToQ4_0(src.Wup);
+                        if (src.Wdown != null && src.Wdown.Length > 0) qLayer.Wdown_Q4 = QuantizeToQ4_0(src.Wdown);
+                    }
+
+                    qModel.Layers[l] = qLayer;
                 }
 
                 if (model.LmHead != null && model.LmHead.Length > 0 && model.LmHead != model.TokenEmbeddings)
