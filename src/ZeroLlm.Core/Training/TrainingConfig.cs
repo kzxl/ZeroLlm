@@ -32,6 +32,12 @@ namespace ZeroLlm.Core.Training
         public float Epsilon { get; set; } = 1e-8f;
         public float MaxGradNorm { get; set; } = 1.0f;
         public TrainingMode Mode { get; set; } = TrainingMode.Full;
+
+        /// <summary>
+        /// Auxiliary load balancing loss weight for Sparse MoE router training (default: 0.01).
+        /// Penalizes variance in routing probabilities to prevent expert collapse.
+        /// </summary>
+        public float AuxiliaryLossWeight { get; set; } = 0.01f;
     }
 
     /// <summary>

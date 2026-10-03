@@ -1,5 +1,6 @@
 using System;
 using Xunit;
+using ZeroLlm.Core.Engine;
 using ZeroLlm.Core.Layers;
 using ZeroLlm.Core.Memory;
 
@@ -147,6 +148,51 @@ namespace ZeroLlm.Tests
                 Assert.False(float.IsNaN(residual[d]));
                 Assert.True(residual[d] > 0.0f, $"Residual at dim {d} should be positive.");
             }
+        }
+
+        [Fact]
+        public void LlmTrainer_MoE_TrainingStep_Should_UpdateWeights_And_NotProduceNaN()
+        {
+            var config = LlmModelConfig.CreateMicroMoE(
+                vocabSize: 64,
+                contextLength: 32,
+                embeddingDim: 16,
+                layerCount: 2,
+                headCount: 2,
+                headCountKv: 2,
+                feedForwardDim: 32,
+                expertCount: 4,
+                expertUsedCount: 2);
+
+            var model = LlmModel.CreateSynthetic(config, seed: 123);
+            var trainer = new ZeroLlm.Core.Training.LlmTrainer(model, new ZeroLlm.Core.Training.TrainingConfig
+            {
+                LearningRate = 1e-2f,
+                AuxiliaryLossWeight = 0.05f,
+                Mode = ZeroLlm.Core.Training.TrainingMode.Full
+            });
+
+            float initialRouterWeight = model.Layers[0].Wrouter![0];
+
+            int[] tokens = new int[] { 1, 10, 15, 20, 25, 30, 2 };
+            var result1 = trainer.TrainStep(tokens, targetStartPos: 2);
+
+            Assert.False(float.IsNaN(result1.Loss));
+            Assert.True(result1.Loss > 0f);
+            Assert.True(result1.TargetTokenCount > 0);
+
+            // Run 5 more steps to verify loss decreases and stability
+            float lastLoss = result1.Loss;
+            for (int i = 0; i < 5; i++)
+            {
+                var stepResult = trainer.TrainStep(tokens, targetStartPos: 2);
+                Assert.False(float.IsNaN(stepResult.Loss));
+                lastLoss = stepResult.Loss;
+            }
+
+            Assert.True(lastLoss < result1.Loss, $"Loss should decrease: initial={result1.Loss}, final={lastLoss}");
+            float updatedRouterWeight = model.Layers[0].Wrouter![0];
+            Assert.NotEqual(initialRouterWeight, updatedRouterWeight);
         }
     }
 }

@@ -102,5 +102,39 @@ namespace ZeroLlm.Core.Engine
         /// </summary>
         public static LlmModelConfig CreateVietnameseErpMicro(int vocabSize = 16000, int contextLength = 1024)
             => CreateMicro(vocabSize, contextLength);
+
+        /// <summary>
+        /// Creates a practical Small-Scale MoE SLM (~45M total parameters, ~25M active FLOPs per token).
+        /// Balances multi-domain ERP knowledge retention with high-speed CPU execution.
+        /// </summary>
+        public static LlmModelConfig CreateSmallMoE(
+            int vocabSize = 16000,
+            int contextLength = 2048,
+            int embeddingDim = 512,
+            int layerCount = 8,
+            int headCount = 8,
+            int headCountKv = 4,
+            int feedForwardDim = 1024,
+            int expertCount = 4,
+            int expertUsedCount = 2)
+        {
+            return new LlmModelConfig
+            {
+                Architecture = "llama",
+                VocabSize = vocabSize,
+                ContextLength = contextLength,
+                EmbeddingDim = embeddingDim,
+                LayerCount = layerCount,
+                HeadCount = headCount,
+                HeadCountKv = headCountKv,
+                FeedForwardDim = feedForwardDim,
+                RmsNormEps = 1e-5f,
+                RopeFreqBase = 10000.0f,
+                BosTokenId = 1,
+                EosTokenId = 2,
+                ExpertCount = expertCount,
+                ExpertUsedCount = expertUsedCount
+            };
+        }
     }
 }
