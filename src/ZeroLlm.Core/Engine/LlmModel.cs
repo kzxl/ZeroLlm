@@ -6,6 +6,22 @@ using ZeroLlm.Core.Quantization;
 
 namespace ZeroLlm.Core.Engine
 {
+    public sealed class LlmExpertWeights
+    {
+        public int ExpertId { get; set; }
+        public float[] Wgate { get; set; } = Array.Empty<float>();
+        public float[] Wup { get; set; } = Array.Empty<float>();
+        public float[] Wdown { get; set; } = Array.Empty<float>();
+
+        public BlockQ8_0[]? Wgate_Q8 { get; set; }
+        public BlockQ8_0[]? Wup_Q8 { get; set; }
+        public BlockQ8_0[]? Wdown_Q8 { get; set; }
+
+        public BlockQ4_0[]? Wgate_Q4 { get; set; }
+        public BlockQ4_0[]? Wup_Q4 { get; set; }
+        public BlockQ4_0[]? Wdown_Q4 { get; set; }
+    }
+
     public sealed class LlmLayerWeights
     {
         public float[] AttnNorm { get; set; } = Array.Empty<float>();
@@ -35,6 +51,13 @@ namespace ZeroLlm.Core.Engine
         public BlockQ4_0[]? Wgate_Q4 { get; set; }
         public BlockQ4_0[]? Wup_Q4 { get; set; }
         public BlockQ4_0[]? Wdown_Q4 { get; set; }
+
+        // Sparse Mixture-of-Experts (MoE) Weights
+        public float[] Wrouter { get; set; } = Array.Empty<float>();
+        public BlockQ8_0[]? Wrouter_Q8 { get; set; }
+        public BlockQ4_0[]? Wrouter_Q4 { get; set; }
+        public LlmExpertWeights[]? Experts { get; set; }
+        public bool IsMoE => Experts != null && Experts.Length > 0;
     }
 
     /// <summary>
@@ -81,18 +104,39 @@ namespace ZeroLlm.Core.Engine
 
             for (int l = 0; l < config.LayerCount; l++)
             {
-                model.Layers[l] = new LlmLayerWeights
+                var layer = new LlmLayerWeights
                 {
                     AttnNorm = CreateConstantArray(config.EmbeddingDim, 1.0f),
                     Wq = CreateRandomArray(config.EmbeddingDim * qDim, rand, 0.02f),
                     Wk = CreateRandomArray(config.EmbeddingDim * kvDim, rand, 0.02f),
                     Wv = CreateRandomArray(config.EmbeddingDim * kvDim, rand, 0.02f),
                     Wo = CreateRandomArray(qDim * config.EmbeddingDim, rand, 0.02f),
-                    FfnNorm = CreateConstantArray(config.EmbeddingDim, 1.0f),
-                    Wgate = CreateRandomArray(config.EmbeddingDim * config.FeedForwardDim, rand, 0.02f),
-                    Wup = CreateRandomArray(config.EmbeddingDim * config.FeedForwardDim, rand, 0.02f),
-                    Wdown = CreateRandomArray(config.FeedForwardDim * config.EmbeddingDim, rand, 0.02f)
+                    FfnNorm = CreateConstantArray(config.EmbeddingDim, 1.0f)
                 };
+
+                if (config.IsMoE)
+                {
+                    layer.Wrouter = CreateRandomArray(config.EmbeddingDim * config.ExpertCount, rand, 0.02f);
+                    layer.Experts = new LlmExpertWeights[config.ExpertCount];
+                    for (int e = 0; e < config.ExpertCount; e++)
+                    {
+                        layer.Experts[e] = new LlmExpertWeights
+                        {
+                            ExpertId = e,
+                            Wgate = CreateRandomArray(config.EmbeddingDim * config.FeedForwardDim, rand, 0.02f),
+                            Wup = CreateRandomArray(config.EmbeddingDim * config.FeedForwardDim, rand, 0.02f),
+                            Wdown = CreateRandomArray(config.FeedForwardDim * config.EmbeddingDim, rand, 0.02f)
+                        };
+                    }
+                }
+                else
+                {
+                    layer.Wgate = CreateRandomArray(config.EmbeddingDim * config.FeedForwardDim, rand, 0.02f);
+                    layer.Wup = CreateRandomArray(config.EmbeddingDim * config.FeedForwardDim, rand, 0.02f);
+                    layer.Wdown = CreateRandomArray(config.FeedForwardDim * config.EmbeddingDim, rand, 0.02f);
+                }
+
+                model.Layers[l] = layer;
             }
 
             return model;
@@ -122,6 +166,12 @@ namespace ZeroLlm.Core.Engine
             writer.AddMetadata("tokenizer.ggml.bos_token_id", (uint)Config.BosTokenId);
             writer.AddMetadata("tokenizer.ggml.eos_token_id", (uint)Config.EosTokenId);
 
+            if (Config.IsMoE)
+            {
+                writer.AddMetadata($"{arch}.expert_count", (uint)Config.ExpertCount);
+                writer.AddMetadata($"{arch}.expert_used_count", (uint)Config.ExpertUsedCount);
+            }
+
             // Tensors
             // 1. Embeddings
             WriteTensor(writer, "token_embd.weight",
@@ -141,9 +191,24 @@ namespace ZeroLlm.Core.Engine
                 WriteTensor(writer, $"blk.{l}.attn_v.weight", new ulong[] { (ulong)Config.EmbeddingDim, (ulong)kvDim }, layer.Wv, layer.Wv_Q8, layer.Wv_Q4);
                 WriteTensor(writer, $"blk.{l}.attn_output.weight", new ulong[] { (ulong)qDim, (ulong)Config.EmbeddingDim }, layer.Wo, layer.Wo_Q8, layer.Wo_Q4);
                 writer.AddTensor($"blk.{l}.ffn_norm.weight", new ulong[] { (ulong)Config.EmbeddingDim }, GgufTensorType.F32, FloatArrayToBytes(layer.FfnNorm));
-                WriteTensor(writer, $"blk.{l}.ffn_gate.weight", new ulong[] { (ulong)Config.EmbeddingDim, (ulong)Config.FeedForwardDim }, layer.Wgate, layer.Wgate_Q8, layer.Wgate_Q4);
-                WriteTensor(writer, $"blk.{l}.ffn_up.weight", new ulong[] { (ulong)Config.EmbeddingDim, (ulong)Config.FeedForwardDim }, layer.Wup, layer.Wup_Q8, layer.Wup_Q4);
-                WriteTensor(writer, $"blk.{l}.ffn_down.weight", new ulong[] { (ulong)Config.FeedForwardDim, (ulong)Config.EmbeddingDim }, layer.Wdown, layer.Wdown_Q8, layer.Wdown_Q4);
+
+                if (Config.IsMoE && layer.Experts != null && layer.Experts.Length > 0)
+                {
+                    WriteTensor(writer, $"blk.{l}.ffn_gate_inp.weight", new ulong[] { (ulong)Config.EmbeddingDim, (ulong)Config.ExpertCount }, layer.Wrouter, layer.Wrouter_Q8, layer.Wrouter_Q4);
+                    for (int e = 0; e < layer.Experts.Length; e++)
+                    {
+                        var exp = layer.Experts[e];
+                        WriteTensor(writer, $"blk.{l}.ffn_gate.{e}.weight", new ulong[] { (ulong)Config.EmbeddingDim, (ulong)Config.FeedForwardDim }, exp.Wgate, exp.Wgate_Q8, exp.Wgate_Q4);
+                        WriteTensor(writer, $"blk.{l}.ffn_up.{e}.weight", new ulong[] { (ulong)Config.EmbeddingDim, (ulong)Config.FeedForwardDim }, exp.Wup, exp.Wup_Q8, exp.Wup_Q4);
+                        WriteTensor(writer, $"blk.{l}.ffn_down.{e}.weight", new ulong[] { (ulong)Config.FeedForwardDim, (ulong)Config.EmbeddingDim }, exp.Wdown, exp.Wdown_Q8, exp.Wdown_Q4);
+                    }
+                }
+                else
+                {
+                    WriteTensor(writer, $"blk.{l}.ffn_gate.weight", new ulong[] { (ulong)Config.EmbeddingDim, (ulong)Config.FeedForwardDim }, layer.Wgate, layer.Wgate_Q8, layer.Wgate_Q4);
+                    WriteTensor(writer, $"blk.{l}.ffn_up.weight", new ulong[] { (ulong)Config.EmbeddingDim, (ulong)Config.FeedForwardDim }, layer.Wup, layer.Wup_Q8, layer.Wup_Q4);
+                    WriteTensor(writer, $"blk.{l}.ffn_down.weight", new ulong[] { (ulong)Config.FeedForwardDim, (ulong)Config.EmbeddingDim }, layer.Wdown, layer.Wdown_Q8, layer.Wdown_Q4);
+                }
             }
 
             // 3. Final norm & LM head
@@ -183,6 +248,8 @@ namespace ZeroLlm.Core.Engine
             float ropeFreqBase = reader.Metadata.GetValueOrDefault($"{arch}.rope.freq_base", 10000.0f);
             int bosTokenId = (int)reader.Metadata.GetValueOrDefault("tokenizer.ggml.bos_token_id", 1u);
             int eosTokenId = (int)reader.Metadata.GetValueOrDefault("tokenizer.ggml.eos_token_id", 2u);
+            int expertCount = (int)reader.Metadata.GetValueOrDefault($"{arch}.expert_count", 0u);
+            int expertUsedCount = (int)reader.Metadata.GetValueOrDefault($"{arch}.expert_used_count", 0u);
 
             var tensorMap = new Dictionary<string, GgufTensorInfo>(StringComparer.OrdinalIgnoreCase);
             foreach (var t in reader.Tensors)
@@ -209,7 +276,9 @@ namespace ZeroLlm.Core.Engine
                 RmsNormEps = rmsNormEps,
                 RopeFreqBase = ropeFreqBase,
                 BosTokenId = bosTokenId,
-                EosTokenId = eosTokenId
+                EosTokenId = eosTokenId,
+                ExpertCount = expertCount,
+                ExpertUsedCount = expertUsedCount
             };
 
             var model = new LlmModel(config)
@@ -254,20 +323,52 @@ namespace ZeroLlm.Core.Engine
                 if (tensorMap.TryGetValue($"blk.{l}.ffn_norm.weight", out var tFfnNorm))
                     layer.FfnNorm = ReadTensorFloats(stream, reader.TensorDataOffset, tFfnNorm);
 
-                if (tensorMap.TryGetValue($"blk.{l}.ffn_gate.weight", out var tWgate))
+                if (expertCount > 1)
                 {
-                    LoadTensor(stream, reader.TensorDataOffset, tWgate, out var f32, out var q8, out var q4);
-                    layer.Wgate = f32; layer.Wgate_Q8 = q8; layer.Wgate_Q4 = q4;
+                    layer.Experts = new LlmExpertWeights[expertCount];
+                    if (tensorMap.TryGetValue($"blk.{l}.ffn_gate_inp.weight", out var tRouter))
+                    {
+                        LoadTensor(stream, reader.TensorDataOffset, tRouter, out var f32, out var q8, out var q4);
+                        layer.Wrouter = f32; layer.Wrouter_Q8 = q8; layer.Wrouter_Q4 = q4;
+                    }
+                    for (int e = 0; e < expertCount; e++)
+                    {
+                        var exp = new LlmExpertWeights { ExpertId = e };
+                        if (tensorMap.TryGetValue($"blk.{l}.ffn_gate.{e}.weight", out var tGateExp))
+                        {
+                            LoadTensor(stream, reader.TensorDataOffset, tGateExp, out var f32, out var q8, out var q4);
+                            exp.Wgate = f32; exp.Wgate_Q8 = q8; exp.Wgate_Q4 = q4;
+                        }
+                        if (tensorMap.TryGetValue($"blk.{l}.ffn_up.{e}.weight", out var tUpExp))
+                        {
+                            LoadTensor(stream, reader.TensorDataOffset, tUpExp, out var f32, out var q8, out var q4);
+                            exp.Wup = f32; exp.Wup_Q8 = q8; exp.Wup_Q4 = q4;
+                        }
+                        if (tensorMap.TryGetValue($"blk.{l}.ffn_down.{e}.weight", out var tDownExp))
+                        {
+                            LoadTensor(stream, reader.TensorDataOffset, tDownExp, out var f32, out var q8, out var q4);
+                            exp.Wdown = f32; exp.Wdown_Q8 = q8; exp.Wdown_Q4 = q4;
+                        }
+                        layer.Experts[e] = exp;
+                    }
                 }
-                if (tensorMap.TryGetValue($"blk.{l}.ffn_up.weight", out var tWup))
+                else
                 {
-                    LoadTensor(stream, reader.TensorDataOffset, tWup, out var f32, out var q8, out var q4);
-                    layer.Wup = f32; layer.Wup_Q8 = q8; layer.Wup_Q4 = q4;
-                }
-                if (tensorMap.TryGetValue($"blk.{l}.ffn_down.weight", out var tWdown))
-                {
-                    LoadTensor(stream, reader.TensorDataOffset, tWdown, out var f32, out var q8, out var q4);
-                    layer.Wdown = f32; layer.Wdown_Q8 = q8; layer.Wdown_Q4 = q4;
+                    if (tensorMap.TryGetValue($"blk.{l}.ffn_gate.weight", out var tWgate))
+                    {
+                        LoadTensor(stream, reader.TensorDataOffset, tWgate, out var f32, out var q8, out var q4);
+                        layer.Wgate = f32; layer.Wgate_Q8 = q8; layer.Wgate_Q4 = q4;
+                    }
+                    if (tensorMap.TryGetValue($"blk.{l}.ffn_up.weight", out var tWup))
+                    {
+                        LoadTensor(stream, reader.TensorDataOffset, tWup, out var f32, out var q8, out var q4);
+                        layer.Wup = f32; layer.Wup_Q8 = q8; layer.Wup_Q4 = q4;
+                    }
+                    if (tensorMap.TryGetValue($"blk.{l}.ffn_down.weight", out var tWdown))
+                    {
+                        LoadTensor(stream, reader.TensorDataOffset, tWdown, out var f32, out var q8, out var q4);
+                        layer.Wdown = f32; layer.Wdown_Q8 = q8; layer.Wdown_Q4 = q4;
+                    }
                 }
 
                 model.Layers[l] = layer;

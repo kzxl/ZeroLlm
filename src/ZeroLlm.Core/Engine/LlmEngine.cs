@@ -230,21 +230,41 @@ namespace ZeroLlm.Core.Engine
                 // FFN RMSNorm
                 RmsNorm.Forward(x, layer.FfnNorm, xNorm, cfg.RmsNormEps);
 
-                // SwiGLU FFN
-                if (layer.Wgate_Q8 != null) QuantizedKernels.MatVecMulQ8_0(layer.Wgate_Q8, xNorm, gate, cfg.FeedForwardDim, embDim);
-                else if (layer.Wgate_Q4 != null) QuantizedKernels.MatVecMulQ4_0(layer.Wgate_Q4, xNorm, gate, cfg.FeedForwardDim, embDim);
-                else MatVec(xNorm, layer.Wgate, embDim, cfg.FeedForwardDim, gate);
+                if (layer.IsMoE && layer.Experts != null && layer.Experts.Length > 0)
+                {
+                    // Sparse Mixture-of-Experts (MoE) FFN with Top-K Gating
+                    SparseMoeLayer.Forward(
+                        xNorm,
+                        layer.Wrouter,
+                        layer.Wrouter_Q8,
+                        layer.Wrouter_Q4,
+                        layer.Experts,
+                        cfg.ExpertUsedCount > 0 ? cfg.ExpertUsedCount : 2,
+                        embDim,
+                        cfg.FeedForwardDim,
+                        gate,
+                        up,
+                        swiglu,
+                        x);
+                }
+                else
+                {
+                    // Standard Dense SwiGLU FFN
+                    if (layer.Wgate_Q8 != null) QuantizedKernels.MatVecMulQ8_0(layer.Wgate_Q8, xNorm, gate, cfg.FeedForwardDim, embDim);
+                    else if (layer.Wgate_Q4 != null) QuantizedKernels.MatVecMulQ4_0(layer.Wgate_Q4, xNorm, gate, cfg.FeedForwardDim, embDim);
+                    else MatVec(xNorm, layer.Wgate, embDim, cfg.FeedForwardDim, gate);
 
-                if (layer.Wup_Q8 != null) QuantizedKernels.MatVecMulQ8_0(layer.Wup_Q8, xNorm, up, cfg.FeedForwardDim, embDim);
-                else if (layer.Wup_Q4 != null) QuantizedKernels.MatVecMulQ4_0(layer.Wup_Q4, xNorm, up, cfg.FeedForwardDim, embDim);
-                else MatVec(xNorm, layer.Wup, embDim, cfg.FeedForwardDim, up);
+                    if (layer.Wup_Q8 != null) QuantizedKernels.MatVecMulQ8_0(layer.Wup_Q8, xNorm, up, cfg.FeedForwardDim, embDim);
+                    else if (layer.Wup_Q4 != null) QuantizedKernels.MatVecMulQ4_0(layer.Wup_Q4, xNorm, up, cfg.FeedForwardDim, embDim);
+                    else MatVec(xNorm, layer.Wup, embDim, cfg.FeedForwardDim, up);
 
-                SwiGLU.Forward(gate, up, swiglu);
+                    SwiGLU.Forward(gate, up, swiglu);
 
-                // Down projection + Residual Add
-                if (layer.Wdown_Q8 != null) QuantizedKernels.MatVecAddQ8_0(layer.Wdown_Q8, swiglu, x, embDim, cfg.FeedForwardDim);
-                else if (layer.Wdown_Q4 != null) QuantizedKernels.MatVecAddQ4_0(layer.Wdown_Q4, swiglu, x, embDim, cfg.FeedForwardDim);
-                else MatVecAdd(swiglu, layer.Wdown, cfg.FeedForwardDim, embDim, x);
+                    // Down projection + Residual Add
+                    if (layer.Wdown_Q8 != null) QuantizedKernels.MatVecAddQ8_0(layer.Wdown_Q8, swiglu, x, embDim, cfg.FeedForwardDim);
+                    else if (layer.Wdown_Q4 != null) QuantizedKernels.MatVecAddQ4_0(layer.Wdown_Q4, swiglu, x, embDim, cfg.FeedForwardDim);
+                    else MatVecAdd(swiglu, layer.Wdown, cfg.FeedForwardDim, embDim, x);
+                }
             }
 
             // 3. Final RMSNorm

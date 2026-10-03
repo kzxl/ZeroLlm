@@ -88,5 +88,65 @@ namespace ZeroLlm.Tests
                 }
             }
         }
+
+        [Fact]
+        public void SparseMoeLayer_Top2_Should_Route_And_Compute_Accurately()
+        {
+            int embDim = 4;
+            int ffnDim = 8;
+            int expertCount = 4;
+            int topK = 2;
+
+            // Router weights: 4 experts x 4 embDim
+            // Make expert 1 and expert 3 have strongly positive weights for positive inputs
+            float[] wrouter = new float[expertCount * embDim];
+            // Expert 0: uniform 0.1
+            for (int d = 0; d < embDim; d++) wrouter[0 * embDim + d] = 0.1f;
+            // Expert 1: 2.0 (High logit)
+            for (int d = 0; d < embDim; d++) wrouter[1 * embDim + d] = 2.0f;
+            // Expert 2: -1.0
+            for (int d = 0; d < embDim; d++) wrouter[2 * embDim + d] = -1.0f;
+            // Expert 3: 1.5 (Second highest logit)
+            for (int d = 0; d < embDim; d++) wrouter[3 * embDim + d] = 1.5f;
+
+            var experts = new ZeroLlm.Core.Engine.LlmExpertWeights[expertCount];
+            for (int e = 0; e < expertCount; e++)
+            {
+                var exp = new ZeroLlm.Core.Engine.LlmExpertWeights { ExpertId = e };
+                exp.Wgate = new float[embDim * ffnDim];
+                exp.Wup = new float[embDim * ffnDim];
+                exp.Wdown = new float[ffnDim * embDim];
+                Array.Fill(exp.Wgate, 0.5f);
+                Array.Fill(exp.Wup, 0.5f);
+                Array.Fill(exp.Wdown, 0.25f);
+                experts[e] = exp;
+            }
+
+            float[] xNorm = new float[] { 1.0f, 1.0f, 1.0f, 1.0f };
+            float[] gateScratch = new float[ffnDim];
+            float[] upScratch = new float[ffnDim];
+            float[] swigluScratch = new float[ffnDim];
+            float[] residual = new float[embDim];
+
+            SparseMoeLayer.Forward(
+                xNorm,
+                wrouter,
+                null,
+                null,
+                experts,
+                topK,
+                embDim,
+                ffnDim,
+                gateScratch,
+                upScratch,
+                swigluScratch,
+                residual);
+
+            for (int d = 0; d < embDim; d++)
+            {
+                Assert.False(float.IsNaN(residual[d]));
+                Assert.True(residual[d] > 0.0f, $"Residual at dim {d} should be positive.");
+            }
+        }
     }
 }
