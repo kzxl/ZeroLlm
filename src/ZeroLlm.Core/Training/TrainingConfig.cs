@@ -38,6 +38,12 @@ namespace ZeroLlm.Core.Training
         /// Penalizes variance in routing probabilities to prevent expert collapse.
         /// </summary>
         public float AuxiliaryLossWeight { get; set; } = 0.01f;
+
+        /// <summary>
+        /// Number of sequence steps to accumulate gradients before executing an AdamW optimizer update (default: 1).
+        /// Setting to > 1 stabilizes gradients and significantly boosts CPU training throughput.
+        /// </summary>
+        public int GradientAccumulationSteps { get; set; } = 1;
     }
 
     /// <summary>

@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Numerics;
+using System.Threading.Tasks;
 using ZeroLlm.Core.Engine;
 using ZeroLlm.Core.Layers;
 using ZeroTokenizer.Core.Abstractions;
@@ -16,6 +17,7 @@ namespace ZeroLlm.Core.Training
         private readonly LlmModel _model;
         private readonly TrainingConfig _config;
         private int _step;
+        private int _accumulatedCount;
 
         // Trainable parameter tracking
         private readonly List<ParamGrad> _trainableParams = new List<ParamGrad>();
@@ -230,10 +232,12 @@ namespace ZeroLlm.Core.Training
             int vocabSize = cfg.VocabSize;
             int layers = cfg.LayerCount;
 
-            // Zero all gradients before accumulation
-            for (int i = 0; i < _trainableParams.Count; i++)
+            int accumSteps = Math.Max(1, _config.GradientAccumulationSteps);
+
+            // Zero all gradients at start of accumulation window
+            if (_accumulatedCount == 0)
             {
-                _trainableParams[i].ZeroGrad();
+                Parallel.For(0, _trainableParams.Count, i => _trainableParams[i].ZeroGrad());
             }
 
             // 1. Forward Pass Storage
@@ -303,8 +307,12 @@ namespace ZeroLlm.Core.Training
                     moeSharedDown[pos] = new float[layers][][];
                 }
 
-                xNormFinal[pos] = new float[embDim];
-                logits[pos] = new float[vocabSize];
+                bool isTarget = (pos + 1 >= targetStart);
+                if (isTarget)
+                {
+                    xNormFinal[pos] = new float[embDim];
+                    logits[pos] = new float[vocabSize];
+                }
 
                 // Embedding lookup
                 int tok = tokens[pos];
@@ -451,11 +459,12 @@ namespace ZeroLlm.Core.Training
                     Array.Copy(xOut[pos][l], currentX, embDim);
                 }
 
-                // Final RMSNorm
-                RmsNorm.Forward(currentX, _model.FinalNorm, xNormFinal[pos], cfg.RmsNormEps);
-
-                // LM Head Projection
-                MatVec(xNormFinal[pos], _model.LmHead, embDim, vocabSize, logits[pos]);
+                // Final RMSNorm and LM Head Projection (Target Tokens Only)
+                if (isTarget)
+                {
+                    RmsNorm.Forward(currentX, _model.FinalNorm, xNormFinal[pos], cfg.RmsNormEps);
+                    MatVec(xNormFinal[pos], _model.LmHead, embDim, vocabSize, logits[pos]);
+                }
             }
 
             // 2. Cross-Entropy Loss & dLogits
@@ -465,11 +474,11 @@ namespace ZeroLlm.Core.Training
 
             for (int pos = 0; pos < numPositions; pos++)
             {
+                bool isTarget = (pos + 1 >= targetStart);
+                if (!isTarget) continue;
+
                 dLogits[pos] = new float[vocabSize];
                 int targetTokenId = tokens[pos + 1];
-                bool isTarget = (pos + 1 >= targetStart);
-
-                if (!isTarget) continue;
 
                 // Softmax
                 float maxVal = float.NegativeInfinity;
@@ -508,8 +517,8 @@ namespace ZeroLlm.Core.Training
                 return new TrainStepResult(0f, 0, 0f);
             }
 
-            // Scale gradients by 1 / activeTargets
-            float scale = 1.0f / activeTargets;
+            // Scale gradients by 1 / activeTargets and 1 / accumSteps
+            float scale = (1.0f / activeTargets) / accumSteps;
             for (int pos = 0; pos < numPositions; pos++)
             {
                 if (pos + 1 < targetStart) continue;
@@ -954,26 +963,68 @@ namespace ZeroLlm.Core.Training
                 totalLoss += totalAuxLoss * activeTargets;
             }
 
-            // 5. AdamW Parameter Update Step
-            _step++;
-            float gradNorm = ApplyAdamW();
+            // 5. Parameter Update Step (subject to gradient accumulation)
+            _accumulatedCount++;
+            float gradNorm = 0f;
+            if (_accumulatedCount >= accumSteps)
+            {
+                _step++;
+                gradNorm = ApplyAdamW();
+                _accumulatedCount = 0;
+            }
 
             float avgLoss = totalLoss / activeTargets;
             return new TrainStepResult(avgLoss, activeTargets, gradNorm);
         }
 
+        /// <summary>
+        /// Flushes any pending accumulated gradients by executing an AdamW parameter update.
+        /// </summary>
+        public float FlushGradients()
+        {
+            if (_accumulatedCount > 0)
+            {
+                _step++;
+                float gradNorm = ApplyAdamW();
+                _accumulatedCount = 0;
+                return gradNorm;
+            }
+            return 0f;
+        }
+
         private float ApplyAdamW()
         {
-            // Global gradient norm clipping
+            // Global gradient norm clipping (vectorized reduction across parameters)
             double sumSq = 0.0;
-            for (int p = 0; p < _trainableParams.Count; p++)
+            object syncObj = new object();
+
+            Parallel.For(0, _trainableParams.Count, () => 0.0, (p, loopState, localSum) =>
             {
                 var grads = _trainableParams[p].Grads;
-                for (int i = 0; i < grads.Length; i++)
+                int len = grads.Length;
+                int vecSize = Vector<float>.Count;
+                int simdLimit = len - (len % vecSize);
+
+                unsafe
                 {
-                    sumSq += grads[i] * grads[i];
+                    fixed (float* pG = grads)
+                    {
+                        Vector<float> vAcc = Vector<float>.Zero;
+                        for (int i = 0; i < simdLimit; i += vecSize)
+                        {
+                            var v = *(Vector<float>*)(pG + i);
+                            vAcc += v * v;
+                        }
+                        for (int j = 0; j < vecSize; j++) localSum += vAcc[j];
+                        for (int i = simdLimit; i < len; i++) localSum += pG[i] * pG[i];
+                    }
                 }
-            }
+                return localSum;
+            },
+            localSum =>
+            {
+                lock (syncObj) sumSq += localSum;
+            });
 
             float totalNorm = (float)Math.Sqrt(sumSq);
             float clipScale = 1.0f;
@@ -991,7 +1042,7 @@ namespace ZeroLlm.Core.Training
             float bc1 = 1.0f - (float)Math.Pow(b1, _step);
             float bc2 = 1.0f - (float)Math.Pow(b2, _step);
 
-            for (int p = 0; p < _trainableParams.Count; p++)
+            Parallel.For(0, _trainableParams.Count, p =>
             {
                 var param = _trainableParams[p];
                 var w = param.Weights;
@@ -999,19 +1050,64 @@ namespace ZeroLlm.Core.Training
                 var m = param.M;
                 var v = param.V;
 
-                for (int i = 0; i < w.Length; i++)
+                int len = w.Length;
+                int vecSize = Vector<float>.Count;
+                int simdLimit = len - (len % vecSize);
+
+                var vClip = new Vector<float>(clipScale);
+                var vB1 = new Vector<float>(b1);
+                var vOneMinusB1 = new Vector<float>(1.0f - b1);
+                var vB2 = new Vector<float>(b2);
+                var vOneMinusB2 = new Vector<float>(1.0f - b2);
+                var vInvBc1 = new Vector<float>(1.0f / bc1);
+                var vInvBc2 = new Vector<float>(1.0f / bc2);
+                var vEps = new Vector<float>(eps);
+                var vLr = new Vector<float>(lr);
+                var vWd = new Vector<float>(wd);
+
+                unsafe
                 {
-                    float grad = g[i] * clipScale;
+                    fixed (float* pW = w)
+                    fixed (float* pG = g)
+                    fixed (float* pM = m)
+                    fixed (float* pV = v)
+                    {
+                        for (int i = 0; i < simdLimit; i += vecSize)
+                        {
+                            var vGrad = *(Vector<float>*)(pG + i) * vClip;
+                            var vM_old = *(Vector<float>*)(pM + i);
+                            var vV_old = *(Vector<float>*)(pV + i);
 
-                    m[i] = b1 * m[i] + (1.0f - b1) * grad;
-                    v[i] = b2 * v[i] + (1.0f - b2) * grad * grad;
+                            var vM_new = (vB1 * vM_old) + (vOneMinusB1 * vGrad);
+                            var vV_new = (vB2 * vV_old) + (vOneMinusB2 * (vGrad * vGrad));
 
-                    float mHat = m[i] / bc1;
-                    float vHat = v[i] / bc2;
+                            *(Vector<float>*)(pM + i) = vM_new;
+                            *(Vector<float>*)(pV + i) = vV_new;
 
-                    w[i] -= lr * (mHat / ((float)Math.Sqrt(vHat) + eps) + wd * w[i]);
+                            var vMHat = vM_new * vInvBc1;
+                            var vVHat = vV_new * vInvBc2;
+
+                            var vW_old = *(Vector<float>*)(pW + i);
+                            var vDenom = Vector.SquareRoot(vVHat) + vEps;
+                            var vStep = (vMHat / vDenom) + (vWd * vW_old);
+
+                            *(Vector<float>*)(pW + i) = vW_old - (vLr * vStep);
+                        }
+
+                        for (int i = simdLimit; i < len; i++)
+                        {
+                            float grad = pG[i] * clipScale;
+                            pM[i] = b1 * pM[i] + (1.0f - b1) * grad;
+                            pV[i] = b2 * pV[i] + (1.0f - b2) * grad * grad;
+
+                            float mHat = pM[i] / bc1;
+                            float vHat = pV[i] / bc2;
+
+                            pW[i] -= lr * (mHat / ((float)Math.Sqrt(vHat) + eps) + wd * pW[i]);
+                        }
+                    }
                 }
-            }
+            });
 
             return totalNorm;
         }
@@ -1208,27 +1304,63 @@ namespace ZeroLlm.Core.Training
                 int vecSize = Vector<float>.Count;
                 int simdLimit = inDim - (inDim % vecSize);
 
-                for (int o = 0; o < outDim; o++)
+                if (outDim >= 1024)
                 {
-                    float* pRow = pWeight + (o * inDim);
-                    Vector<float> vSum = Vector<float>.Zero;
+                    IntPtr inPtr = (IntPtr)pInput;
+                    IntPtr wPtr = (IntPtr)pWeight;
+                    IntPtr outPtr = (IntPtr)pOutput;
 
-                    for (int i = 0; i < simdLimit; i += vecSize)
+                    Parallel.For(0, outDim, o =>
                     {
-                        var vIn = *(Vector<float>*)(pInput + i);
-                        var vW = *(Vector<float>*)(pRow + i);
-                        vSum += vIn * vW;
-                    }
+                        float* pIn = (float*)inPtr;
+                        float* pW = (float*)wPtr;
+                        float* pOut = (float*)outPtr;
 
-                    float dot = 0f;
-                    for (int j = 0; j < vecSize; j++) dot += vSum[j];
+                        float* pRow = pW + (o * inDim);
+                        Vector<float> vSum = Vector<float>.Zero;
 
-                    for (int i = simdLimit; i < inDim; i++)
+                        for (int i = 0; i < simdLimit; i += vecSize)
+                        {
+                            var vIn = *(Vector<float>*)(pIn + i);
+                            var vWRow = *(Vector<float>*)(pRow + i);
+                            vSum += vIn * vWRow;
+                        }
+
+                        float dot = 0f;
+                        for (int j = 0; j < vecSize; j++) dot += vSum[j];
+
+                        for (int i = simdLimit; i < inDim; i++)
+                        {
+                            dot += pIn[i] * pRow[i];
+                        }
+
+                        pOut[o] = dot;
+                    });
+                }
+                else
+                {
+                    for (int o = 0; o < outDim; o++)
                     {
-                        dot += pInput[i] * pRow[i];
-                    }
+                        float* pRow = pWeight + (o * inDim);
+                        Vector<float> vSum = Vector<float>.Zero;
 
-                    pOutput[o] = dot;
+                        for (int i = 0; i < simdLimit; i += vecSize)
+                        {
+                            var vIn = *(Vector<float>*)(pInput + i);
+                            var vW = *(Vector<float>*)(pRow + i);
+                            vSum += vIn * vW;
+                        }
+
+                        float dot = 0f;
+                        for (int j = 0; j < vecSize; j++) dot += vSum[j];
+
+                        for (int i = simdLimit; i < inDim; i++)
+                        {
+                            dot += pInput[i] * pRow[i];
+                        }
+
+                        pOutput[o] = dot;
+                    }
                 }
             }
         }
@@ -1311,6 +1443,7 @@ namespace ZeroLlm.Core.Training
                 onProgress?.Invoke(new TrainProgress(step, -1, result.Loss, runningLoss / step, result.GradNorm));
             }
 
+            FlushGradients();
             sw.Stop();
             return new TrainEpochResult
             {
