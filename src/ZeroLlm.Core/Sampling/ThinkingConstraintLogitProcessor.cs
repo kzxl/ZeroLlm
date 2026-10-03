@@ -88,11 +88,11 @@ namespace ZeroLlm.Core.Sampling
             return (tokens.Length > 0) ? tokens[0] : -1;
         }
 
-        public void Reset(int promptTokensCount)
+        public void Reset(int promptTokensCount = -1)
         {
             _promptTokensCount = promptTokensCount;
             _thoughtStartPos = -1;
-            _tokensSeen = promptTokensCount;
+            _tokensSeen = promptTokensCount >= 0 ? promptTokensCount : 0;
             _state = ThinkingState.AwaitingThought;
         }
 
@@ -104,6 +104,11 @@ namespace ZeroLlm.Core.Sampling
             {
                 _promptTokensCount = pastTokens.Length;
                 _tokensSeen = pastTokens.Length;
+                if (pastTokens.Length > 0 && pastTokens[^1] == _thoughtTokenId)
+                {
+                    _state = ThinkingState.InsideThought;
+                    _thoughtStartPos = pastTokens.Length - 1;
+                }
             }
 
             int generatedCount = pastTokens.Length - _promptTokensCount;
