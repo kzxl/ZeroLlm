@@ -84,8 +84,10 @@ namespace ZeroLlm.Core.Engine
             if (promptTokens.Length == 0) yield break;
 
             var cfg = _model.Config;
-            var pastTokens = new List<int>(promptTokens.Length + sampling.MaxTokens);
-            pastTokens.AddRange(promptTokens);
+            int maxCapacity = promptTokens.Length + sampling.MaxTokens + 16;
+            int[] pastTokensBuffer = new int[maxCapacity];
+            Array.Copy(promptTokens, pastTokensBuffer, promptTokens.Length);
+            int pastCount = promptTokens.Length;
 
             // Scratch memory buffers
             float[] x = new float[cfg.EmbeddingDim];
@@ -112,19 +114,25 @@ namespace ZeroLlm.Core.Engine
                 // 2. Autoregressive Generation Loop
                 int currentPos = promptTokens.Length;
                 int generatedCount = 0;
+                var ctxProc = sampling.ContextLogitProcessor;
 
                 while (generatedCount < sampling.MaxTokens)
                 {
                     cancellationToken.ThrowIfCancellationRequested();
 
-                    // Sample next token with grammar/custom logit processing
-                    int nextToken = LlmSampler.Sample(logits, pastTokens.ToArray(), sampling, logitProcessor: logitProcessor);
+                    // Sample next token with grammar/custom logit processing (zero-allocation pastTokens span)
+                    ReadOnlySpan<int> pastSpan = new ReadOnlySpan<int>(pastTokensBuffer, 0, pastCount);
+                    int nextToken = LlmSampler.Sample(logits, pastSpan, sampling, logitProcessor: logitProcessor, contextLogitProcessor: ctxProc);
                     if (nextToken == cfg.EosTokenId || sampling.StopTokens.Contains(nextToken))
                     {
                         break;
                     }
 
-                    pastTokens.Add(nextToken);
+                    if (pastCount < pastTokensBuffer.Length)
+                    {
+                        pastTokensBuffer[pastCount] = nextToken;
+                    }
+                    pastCount++;
                     generatedCount++;
 
                     // Decode and yield piece
