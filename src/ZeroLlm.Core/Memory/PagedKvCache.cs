@@ -1,8 +1,46 @@
 using System;
 using System.Collections.Generic;
+using System.Runtime.CompilerServices;
 
 namespace ZeroLlm.Core.Memory
 {
+    /// <summary>
+    /// Direct zero-lock sequence accessor for GQA attention, eliminating per-token monitor lock contention.
+    /// </summary>
+    public readonly struct KvSequenceView
+    {
+        private readonly KvBlock[] _allBlocks;
+        private readonly int[] _blockIndices;
+        private readonly int _blockSize;
+        private readonly int _layer;
+        public int SequenceLength { get; }
+
+        public KvSequenceView(KvBlock[] allBlocks, int[] blockIndices, int blockSize, int layer, int sequenceLength)
+        {
+            _allBlocks = allBlocks;
+            _blockIndices = blockIndices;
+            _blockSize = blockSize;
+            _layer = layer;
+            SequenceLength = sequenceLength;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public ReadOnlySpan<float> GetKeySpan(int tokenPos)
+        {
+            int blockIdx = tokenPos / _blockSize;
+            int slotIdx = tokenPos % _blockSize;
+            return _allBlocks[_blockIndices[blockIdx]].GetKeySpan(_layer, slotIdx);
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public ReadOnlySpan<float> GetValueSpan(int tokenPos)
+        {
+            int blockIdx = tokenPos / _blockSize;
+            int slotIdx = tokenPos % _blockSize;
+            return _allBlocks[_blockIndices[blockIdx]].GetValueSpan(_layer, slotIdx);
+        }
+    }
+
     /// <summary>
     /// High-throughput Paged KV-Cache block allocator preventing memory fragmentation in LLM inference.
     /// </summary>
@@ -132,6 +170,23 @@ namespace ZeroLlm.Core.Memory
                 int blockIdx = tokenPos / BlockSize;
                 int slotIdx = tokenPos % BlockSize;
                 return _allBlocks[table[blockIdx]].GetValueSpan(layer, slotIdx);
+            }
+        }
+
+        /// <summary>
+        /// Obtains a zero-lock, direct-indexed view of Key and Value vectors for a sequence and layer.
+        /// </summary>
+        public KvSequenceView GetSequenceView(int seqId, int layer)
+        {
+            lock (_lock)
+            {
+                if (!_blockTables.TryGetValue(seqId, out var table) || !_seqLengths.TryGetValue(seqId, out int seqLen))
+                {
+                    return new KvSequenceView(_allBlocks, Array.Empty<int>(), BlockSize, layer, 0);
+                }
+
+                int[] indices = table.ToArray();
+                return new KvSequenceView(_allBlocks, indices, BlockSize, layer, seqLen);
             }
         }
 

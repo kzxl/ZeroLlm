@@ -22,21 +22,21 @@ namespace ZeroLlm.Core.Quantization
                 BlockQ8_0* block = pW + b;
                 float scale = block->GetScale();
                 float* bX = pX + (b * BlockQ8_0.BlockSize);
+                sbyte* qs = block->Qs;
 
-                float blockSum = 0.0f;
-                for (int i = 0; i < 32; i += 8)
-                {
-                    blockSum += (bX[i] * block->Qs[i])
-                              + (bX[i + 1] * block->Qs[i + 1])
-                              + (bX[i + 2] * block->Qs[i + 2])
-                              + (bX[i + 3] * block->Qs[i + 3])
-                              + (bX[i + 4] * block->Qs[i + 4])
-                              + (bX[i + 5] * block->Qs[i + 5])
-                              + (bX[i + 6] * block->Qs[i + 6])
-                              + (bX[i + 7] * block->Qs[i + 7]);
-                }
+                float s0 = (bX[0] * qs[0]) + (bX[1] * qs[1]) + (bX[2] * qs[2]) + (bX[3] * qs[3])
+                         + (bX[4] * qs[4]) + (bX[5] * qs[5]) + (bX[6] * qs[6]) + (bX[7] * qs[7]);
 
-                totalSum += blockSum * scale;
+                float s1 = (bX[8] * qs[8]) + (bX[9] * qs[9]) + (bX[10] * qs[10]) + (bX[11] * qs[11])
+                         + (bX[12] * qs[12]) + (bX[13] * qs[13]) + (bX[14] * qs[14]) + (bX[15] * qs[15]);
+
+                float s2 = (bX[16] * qs[16]) + (bX[17] * qs[17]) + (bX[18] * qs[18]) + (bX[19] * qs[19])
+                         + (bX[20] * qs[20]) + (bX[21] * qs[21]) + (bX[22] * qs[22]) + (bX[23] * qs[23]);
+
+                float s3 = (bX[24] * qs[24]) + (bX[25] * qs[25]) + (bX[26] * qs[26]) + (bX[27] * qs[27])
+                         + (bX[28] * qs[28]) + (bX[29] * qs[29]) + (bX[30] * qs[30]) + (bX[31] * qs[31]);
+
+                totalSum += ((s0 + s1) + (s2 + s3)) * scale;
             }
             return totalSum;
         }
@@ -70,22 +70,29 @@ namespace ZeroLlm.Core.Quantization
                 BlockQ4_0* block = pW + b;
                 float scale = block->GetScale();
                 float* bX = pX + (b * BlockQ4_0.BlockSize);
+                byte* qs = block->Qs;
 
-                float blockSum = 0.0f;
-                for (int i = 0; i < 16; i += 4)
-                {
-                    byte val0 = block->Qs[i];
-                    byte val1 = block->Qs[i + 1];
-                    byte val2 = block->Qs[i + 2];
-                    byte val3 = block->Qs[i + 3];
+                float s0 = (bX[0] * ((qs[0] & 0x0F) - 8)) + (bX[16] * ((qs[0] >> 4) - 8))
+                         + (bX[1] * ((qs[1] & 0x0F) - 8)) + (bX[17] * ((qs[1] >> 4) - 8))
+                         + (bX[2] * ((qs[2] & 0x0F) - 8)) + (bX[18] * ((qs[2] >> 4) - 8))
+                         + (bX[3] * ((qs[3] & 0x0F) - 8)) + (bX[19] * ((qs[3] >> 4) - 8));
 
-                    blockSum += (bX[i] * ((val0 & 0x0F) - 8)) + (bX[i + 16] * ((val0 >> 4) - 8))
-                              + (bX[i + 1] * ((val1 & 0x0F) - 8)) + (bX[i + 17] * ((val1 >> 4) - 8))
-                              + (bX[i + 2] * ((val2 & 0x0F) - 8)) + (bX[i + 18] * ((val2 >> 4) - 8))
-                              + (bX[i + 3] * ((val3 & 0x0F) - 8)) + (bX[i + 19] * ((val3 >> 4) - 8));
-                }
+                float s1 = (bX[4] * ((qs[4] & 0x0F) - 8)) + (bX[20] * ((qs[4] >> 4) - 8))
+                         + (bX[5] * ((qs[5] & 0x0F) - 8)) + (bX[21] * ((qs[5] >> 4) - 8))
+                         + (bX[6] * ((qs[6] & 0x0F) - 8)) + (bX[22] * ((qs[6] >> 4) - 8))
+                         + (bX[7] * ((qs[7] & 0x0F) - 8)) + (bX[23] * ((qs[7] >> 4) - 8));
 
-                totalSum += blockSum * scale;
+                float s2 = (bX[8] * ((qs[8] & 0x0F) - 8)) + (bX[24] * ((qs[8] >> 4) - 8))
+                         + (bX[9] * ((qs[9] & 0x0F) - 8)) + (bX[25] * ((qs[9] >> 4) - 8))
+                         + (bX[10] * ((qs[10] & 0x0F) - 8)) + (bX[26] * ((qs[10] >> 4) - 8))
+                         + (bX[11] * ((qs[11] & 0x0F) - 8)) + (bX[27] * ((qs[11] >> 4) - 8));
+
+                float s3 = (bX[12] * ((qs[12] & 0x0F) - 8)) + (bX[28] * ((qs[12] >> 4) - 8))
+                         + (bX[13] * ((qs[13] & 0x0F) - 8)) + (bX[29] * ((qs[13] >> 4) - 8))
+                         + (bX[14] * ((qs[14] & 0x0F) - 8)) + (bX[30] * ((qs[14] >> 4) - 8))
+                         + (bX[15] * ((qs[15] & 0x0F) - 8)) + (bX[31] * ((qs[15] >> 4) - 8));
+
+                totalSum += ((s0 + s1) + (s2 + s3)) * scale;
             }
             return totalSum;
         }

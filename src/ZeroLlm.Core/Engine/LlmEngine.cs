@@ -42,6 +42,10 @@ namespace ZeroLlm.Core.Engine
                 layerCount: cfg.LayerCount,
                 kvHeadCount: cfg.HeadCountKv,
                 headDim: cfg.HeadDim);
+
+            // Precompute RoPE trigonometric cache for context length
+            int maxPositions = Math.Max(1024, cfg.ContextLength);
+            RoPE.EnsureCache(maxPositions, cfg.HeadDim, cfg.RopeFreqBase);
         }
 
         public Task<string> CompleteAsync(string prompt, CancellationToken cancellationToken = default)
